@@ -15,10 +15,11 @@ By inheriting from this module you make your module able to deal with parameters
             #
             ## typical usage:
             # $job->param_init( 
-            #       $runObj->param_defaults(),                      # module-wide built-in defaults have the lowest precedence (will always be the same for this module)
-            #       $self->db->get_PipelineWideParametersAdaptor->fetch_param_hash(), # then come the pipeline-wide parameters from the 'meta' table (define things common to all modules in this pipeline)
-            #       $self->analysis->parameters(),                  # analysis-wide 'parameters' are even more specific (can be defined differently for several occurence of the same module)
-            #       $job->input_id(),                               # job-specific 'input_id' parameters have the highest precedence
+            #       $runObj->param_defaults(),          # module-wide built-in defaults have the lowest precedence (will always be the same for this module)
+            #       $hive_pipeline->params_as_hash(),   # then come the pipeline-wide parameters from the 'pipeline_wide_parameters' table (define things common to all analyses in this pipeline)
+            #       $self->analysis->parameters(),      # analysis-wide 'parameters' are even more specific (can be defined differently for several occurence of the same module)
+            #       $job->input_id(),                   # job-specific 'input_id' parameters have the highest precedence
+            #       $job->accu_hash(),                  # parameters accumulated and sent for this job by other preceding jobs
             # );
           
 
@@ -50,7 +51,7 @@ By inheriting from this module you make your module able to deal with parameters
 
 =head1 LICENSE
 
-    Copyright [1999-2014] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
+    Copyright [1999-2015] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
 
     Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
     You may obtain a copy of the License at
@@ -101,24 +102,19 @@ sub new {
 sub param_init {
                     
     my $self                = shift @_;
-    my $strict_hash_format  = shift @_;
 
     my %unsubstituted_param_hash = ();
 
     foreach my $source (@_) {
         if(ref($source) ne 'HASH') {
-            if($strict_hash_format or $source=~/^\{.*\}$/) {
-                my $param_hash = eval($source) || {};
-                if($@ or (ref($param_hash) ne 'HASH')) {
-                    if($self->can('transient_error')) {
-                        $self->transient_error(0);
-                    }
-                    die "Expected a {'param'=>'value'} hashref, but got the following string instead: '$source'\n";
+            my $param_hash = eval($source) || {};
+            if($@ or (ref($param_hash) ne 'HASH')) {
+                if($self->can('transient_error')) {
+                    $self->transient_error(0);
                 }
-                $source = $param_hash;
-            } else {
-                $source = {};
+                die "Expected a {'param'=>'value'} hashref, but got the following string instead: '$source'\n";
             }
+            $source = $param_hash;
         }
         while(my ($k,$v) = each %$source ) {
             $unsubstituted_param_hash{$k} = $v;
@@ -232,7 +228,7 @@ sub param_is_defined {
 
     Arg [2]    : (optional) $param_value
 
-    Description: A getter/setter method for a job's parameters that are initialized through 4 levels of precedence (see param_init() )
+    Description: A getter/setter method for a job's parameters that are initialized through multiple levels of precedence (see param_init() )
 
     Example 1  : my $source = $self->param('source'); # acting as a getter
 
@@ -365,12 +361,14 @@ sub _subst_one_hashpair {
     } elsif($inside_hashes=~/^expr\((.*)\)expr$/) {
 
         my $expression = $1;
-            # FIXME: the following two lines will have to be switched to drop support for $old_substitution_syntax and stay with #new_substitution_syntax#
-        $expression=~s{(?:\$(\w+)|#(\w+)#)}{stringify($self->_param_possibly_overridden($1 // $2, $overriding_hash))}eg;    # substitute-by-value (bulky, but supports old syntax)
-#        $expression=~s{(?:#(\w+)#)}{\$self->_param_possibly_overridden('$1', \$overriding_hash)}g;                         # substitute-by-call (no longer supports old syntax)
+
+        if($expression=~/\$\w+/) {
+            warn "ParamWarning: possibly using old substitution syntax in expression '$expression'; please use new syntax '#alpha#' instead of old '\$alpha'.\n";
+        }
+
+        $expression=~s{(?:#(\w+)#)}{\$self->_param_possibly_overridden('$1', \$overriding_hash)}g;
 
         $value = eval "return $expression";     # NB: 'return' is needed to protect the hashrefs from being interpreted as scoping blocks
-# warn "SOH: #$inside_hashes# becomes $expression and is then evaluated into ".stringify($value)."\n";
     }
 
     warn "ParamWarning: substituting an undefined value of #$inside_hashes#\n" unless(defined($value));

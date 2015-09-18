@@ -17,7 +17,10 @@
 =head1 DESCRIPTION
 
     This is a Bioinformatics-specific "Factory" Runnable that splits a given Fasta file into smaller chunks
-    and dataflows one job per chunk.
+    and dataflows one job per chunk. Note that:
+        - the files are created in the current directory.
+        - the Runnable does not split the individual sequences, it only groups them in a way that none of the output files will
+          be longer than param('max_chunk_length').
 
     The following parameters are supported:
 
@@ -29,9 +32,11 @@
 
         param('output_suffix');     # A common suffix for output files: 'output_suffix' => '.nt'
 
+        param('hash_directories');  # Boolean (default to 0): should the output files be put in different ("hashed") directories
+
 =head1 LICENSE
 
-    Copyright [1999-2014] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
+    Copyright [1999-2015] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
 
     Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
     You may obtain a copy of the License at
@@ -52,9 +57,14 @@
 package Bio::EnsEMBL::Hive::RunnableDB::FastaFactory;
 
 use strict;
+use warnings;
+
+use Bio::SeqIO;
+use File::Path;
+
+use Bio::EnsEMBL::Hive::Utils ('dir_revhash');
 
 use base ('Bio::EnsEMBL::Hive::Process');
-use Bio::SeqIO;
 
 
 =head2 param_defaults
@@ -69,6 +79,7 @@ sub param_defaults {
         'max_chunk_length'  => 100000,
         'output_prefix'     => 'my_chunk_',
         'output_suffix'     => '.fasta',
+        'hash_directories'  => 0,
     };
 }
 
@@ -126,23 +137,29 @@ sub write_output {
     my $chunk_length = 0;   # total length of the current chunk
     my $chunk_size   = 0;   # number of sequences in the current chunk
     my $chunk_name   = $output_prefix.$chunk_number.$output_suffix;
+    if ($self->param('hash_directories')) {
+        my $dir_tree = dir_revhash($chunk_number);
+        if ($dir_tree ne '') {
+            mkpath($dir_tree);
+            $chunk_name = $dir_tree.'/'.$chunk_name;
+        }
+    }
     my $chunk_seqio  = Bio::SeqIO->new(-file => '>'.$chunk_name, -format => 'fasta');
-
+    
     while (my $seq_object = $input_seqio->next_seq) {
-        if((my $seq_length = $seq_object->length()) + $chunk_length <= $max_chunk_length) {
 
-                # add to the current chunk:
-            $chunk_seqio->write_seq( $seq_object );
-            $chunk_length += $seq_length;
-            $chunk_size   += 1;
-        } else {
+        $chunk_seqio->write_seq( $seq_object );
+        $chunk_length += $seq_object->length();
+        $chunk_size   += 1;
+	
+        if ($chunk_length > $max_chunk_length) {
 
                 # dataflow the current chunk:
             $self->dataflow_output_id( {
-                'chunk_name' => $chunk_name,
-                'chunk_number' => $chunk_number,
-                'chunk_length' => $chunk_length,
-                'chunk_size' => $chunk_size
+                'chunk_name'    => $chunk_name,
+                'chunk_number'  => $chunk_number,
+                'chunk_length'  => $chunk_length,
+                'chunk_size'    => $chunk_size
             }, 2);
 
                 # start writing to the next one:
@@ -150,6 +167,13 @@ sub write_output {
             $chunk_size     = 0;
             $chunk_number++;
             $chunk_name     = $output_prefix.$chunk_number.$output_suffix;
+            if ($self->param('hash_directories')) {
+                my $dir_tree = dir_revhash($chunk_number);
+                if ($dir_tree ne '') {
+                    mkpath($dir_tree);
+                    $chunk_name = $dir_tree.'/'.$chunk_name;
+                }
+            }
             $chunk_seqio    = Bio::SeqIO->new(-file => '>'.$chunk_name, -format => 'fasta');
         }
     }
@@ -157,11 +181,14 @@ sub write_output {
     if($chunk_size) {   # flush the last chunk:
 
         $self->dataflow_output_id( {
-            'chunk_name' => $chunk_name,
-            'chunk_number' => $chunk_number,
-            'chunk_length' => $chunk_length,
-            'chunk_size' => $chunk_size
+            'chunk_name'    => $chunk_name,
+            'chunk_number'  => $chunk_number,
+            'chunk_length'  => $chunk_length,
+            'chunk_size'    => $chunk_size
         }, 2);
+
+    } else {
+        unlink $chunk_name unless (stat($chunk_name))[7];
     }
 }
 

@@ -7,7 +7,7 @@ DESCRIPTION
 
 LICENSE
 
-    Copyright [1999-2014] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
+    Copyright [1999-2015] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
 
     Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
     You may obtain a copy of the License at
@@ -58,8 +58,8 @@ CREATE OR REPLACE VIEW progress AS
 CREATE OR REPLACE VIEW msg AS
     SELECT a.analysis_id, a.logic_name, m.*
     FROM log_message m
-    LEFT JOIN job j ON (j.job_id=m.job_id)
-    LEFT JOIN analysis_base a ON (a.analysis_id=j.analysis_id);
+    LEFT JOIN role USING (role_id)
+    LEFT JOIN analysis_base a USING (analysis_id);
 
 
 -- show statistics of Workers' real resource usage by analysis -------------------------------------------
@@ -69,38 +69,55 @@ CREATE OR REPLACE VIEW msg AS
 --       select * from resource_usage_stats where logic_name like 'family_blast%';
 
 CREATE OR REPLACE VIEW resource_usage_stats AS
-    SELECT CONCAT(logic_name,'(',analysis_id,')') analysis,
+    SELECT CONCAT(a.logic_name,'(',a.analysis_id,')') analysis,
            w.meadow_type,
            CONCAT(rc.name,'(',rc.resource_class_id,')') resource_class,
            u.exit_status,
            count(*) workers,
-           min(mem_megs), avg(mem_megs), max(mem_megs),
-           min(swap_megs), avg(swap_megs), max(swap_megs)
-    FROM analysis_base
-    JOIN resource_class rc USING(resource_class_id)
-    LEFT JOIN worker w USING(analysis_id)
+           min(mem_megs) AS min_mem_megs, round(avg(mem_megs),2) AS avg_mem_megs, max(mem_megs) AS max_mem_megs,
+           min(swap_megs) AS min_swap_megs, round(avg(swap_megs),2) AS avg_swap_megs, max(swap_megs) AS max_swap_megs
+    FROM resource_class rc
+    JOIN analysis_base a USING(resource_class_id)
+    LEFT JOIN role r USING(analysis_id)
+    LEFT JOIN worker w USING(worker_id)
     LEFT JOIN worker_resource_usage u USING (worker_id)
-    GROUP BY analysis_id, w.meadow_type, u.exit_status
-    ORDER BY analysis_id, w.meadow_type, u.exit_status;
+    GROUP BY a.analysis_id, w.meadow_type, rc.resource_class_id, u.exit_status
+    ORDER BY a.analysis_id, w.meadow_type, rc.resource_class_id, u.exit_status;
 
 
-#### time an analysis or group of analyses (given by a name pattern) ######################################
-# You'll get better precision when the analyses involved have been done or failed rather than still running.
-#
-# Usage:
-#       call time_analysis('%');                # time the whole pipeline
-#       call time_analysis('load_uniprot%');    # time the group of analyses dealing with loading Uniprot members
-#       call time_analysis('mcl');              # time one specific analysis
+-- show the roles that are currently live (grouped by meadow_users, resource_classes and analyses) -------
+--
+-- Usage:
+--       select * from live_roles;
+--       select * from live_roles where resource_class_id=12;
+
+CREATE OR REPLACE VIEW live_roles AS
+    SELECT w.meadow_user, w.meadow_type, w.resource_class_id, rc.name resource_class_name, r.analysis_id, a.logic_name, count(*)
+    FROM worker w
+    JOIN role r USING(worker_id)
+    LEFT JOIN resource_class rc ON w.resource_class_id=rc.resource_class_id
+    LEFT JOIN analysis_base a USING(analysis_id)
+    WHERE r.when_finished IS NULL
+    GROUP BY w.meadow_user, w.meadow_type, w.resource_class_id, rc.name, r.analysis_id, a.logic_name;
+
+
+-- time an analysis or group of analyses (given by a name pattern) ----------------------------------------
+--
+-- Usage:
+--       call time_analysis('%');                # time the whole pipeline
+--       call time_analysis('load_uniprot%');    # time the group of analyses dealing with loading Uniprot members
+--       call time_analysis('mcl');              # time one specific analysis
 
 DROP PROCEDURE IF EXISTS time_analysis;
-CREATE PROCEDURE time_analysis(IN param_logic_name_pattern char(64))
+CREATE PROCEDURE time_analysis(IN analyses_pattern CHAR(64))
 READS SQL DATA
     SELECT
-        (UNIX_TIMESTAMP(max(last_check_in))-UNIX_TIMESTAMP(min(born)))/60 AS measured_in_minutes,
-        (UNIX_TIMESTAMP(max(last_check_in))-UNIX_TIMESTAMP(min(born)))/3600 AS measured_in_hours,
-        (UNIX_TIMESTAMP(max(last_check_in))-UNIX_TIMESTAMP(min(born)))/3600/24 AS measured_in_days
-        FROM worker JOIN analysis_base USING (analysis_id)
-        WHERE logic_name like param_logic_name_pattern;
+        COUNT(*)-COUNT(when_finished) AS still_running,
+        (UNIX_TIMESTAMP(CASE WHEN COUNT(*)>COUNT(when_finished) THEN CURRENT_TIMESTAMP ELSE max(when_finished) END) - UNIX_TIMESTAMP(min(when_started)))/60 AS measured_in_minutes,
+        (UNIX_TIMESTAMP(CASE WHEN COUNT(*)>COUNT(when_finished) THEN CURRENT_TIMESTAMP ELSE max(when_finished) END) - UNIX_TIMESTAMP(min(when_started)))/3600 AS measured_in_hours,
+        (UNIX_TIMESTAMP(CASE WHEN COUNT(*)>COUNT(when_finished) THEN CURRENT_TIMESTAMP ELSE max(when_finished) END) - UNIX_TIMESTAMP(min(when_started)))/3600/24 AS measured_in_days
+        FROM role JOIN analysis_base USING (analysis_id)
+        WHERE logic_name LIKE analyses_pattern;
 
 
 #### searches for a given string in job.input_id or analysis_data.data, and returns the  matching jobs.
@@ -149,8 +166,8 @@ DELIMITER //
 CREATE PROCEDURE drop_hive_tables()
 MODIFIES SQL DATA
 BEGIN
-    DROP VIEW IF EXISTS msg, progress;
-    DROP TABLE IF EXISTS pipeline_wide_parameters, analysis_stats_monitor, resource_description, analysis_data, job_file, dataflow_rule, analysis_ctrl_rule, analysis_stats, log_message, accu, job, worker, analysis_base, resource_class, hive_meta;
+    DROP VIEW IF EXISTS msg, progress, resource_usage_stats, live_roles;
+    DROP TABLE IF EXISTS pipeline_wide_parameters, analysis_stats_monitor, worker_resource_usage, resource_description, analysis_data, job_file, dataflow_rule, analysis_ctrl_rule, analysis_stats, log_message, accu, job, role, worker, analysis_base, resource_class, hive_meta;
 END; //
 DELIMITER ;
 

@@ -21,7 +21,7 @@
 
 =head1 LICENSE
 
-    Copyright [1999-2014] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
+    Copyright [1999-2015] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
 
     Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
     You may obtain a copy of the License at
@@ -45,9 +45,9 @@ my $_URLFactory_global_instance;
 package Bio::EnsEMBL::Hive::URLFactory;
 
 use strict;
+use warnings;
 
 use Bio::EnsEMBL::Hive::Utils::URL;
-use Bio::EnsEMBL::Hive::DBSQL::DBAdaptor;
 use Bio::EnsEMBL::Hive::Accumulator;
 use Bio::EnsEMBL::Hive::NakedTable;
 
@@ -73,7 +73,7 @@ sub DESTROY {
 =head2 fetch
 
   Arg[1]     : string $url
-  Example    :  $url = 'mysql://user:pass@host:3306/dbname/table_name?tparam_name=tparam_value;type=compara;discon=1'
+  Example    :  $url = 'mysql://user:pass@host:3306/dbname/table_name?tparam_name=tparam_value;type=compara;disconnect_when_inactive=1'
                 my $object = Bio::EnsEMBL::Hive::URLFactory->fetch($url);
   Description: parses the URL, connects to appropriate DBAdaptor,
                determines appropriate object_adaptor, fetches the object
@@ -92,13 +92,18 @@ sub fetch {
 
     if(my $parsed_url = Bio::EnsEMBL::Hive::Utils::URL::parse( $url )) {
 
+        my $table_name      = $parsed_url->{'table_name'};
+        my $tparam_name     = $parsed_url->{'tparam_name'};
+        my $tparam_value    = $parsed_url->{'tparam_value'};
+
+        unless($table_name=~/^(analysis|job|accu)$/) {  # do not check schema version version when performing table dataflow:
+            $parsed_url->{'conn_params'}{'no_sql_schema_version_check'} = 1;
+        }
+
         my $dba = ($parsed_url->{'dbconn_part'} =~ m{^\w*:///$} )
             ? $default_dba
             : $class->create_cached_dba( @$parsed_url{qw(dbconn_part driver user pass host port dbname conn_params)} );
 
-        my $table_name      = $parsed_url->{'table_name'};
-        my $tparam_name     = $parsed_url->{'tparam_name'};
-        my $tparam_value    = $parsed_url->{'tparam_value'};
 
         if(not $table_name) {
         
@@ -123,7 +128,7 @@ sub fetch {
         } else {
 
             return Bio::EnsEMBL::Hive::NakedTable->new(
-                $dba ? (adaptor => $dba->get_NakedTableAdaptor) : (),
+                $dba ? (adaptor => $dba->get_NakedTableAdaptor( 'table_name' => $table_name ) ) : (),
                 table_name => $table_name,
                 $tparam_value ? (insertion_method => $tparam_value) : (),
             );
@@ -134,21 +139,15 @@ sub fetch {
     return;
 }
 
+
 sub create_cached_dba {
     my ($class, $dbconn_part, $driver, $user, $pass, $host, $port, $dbname, $conn_params) = @_;
 
-    if($driver eq 'mysql') {
-        $user ||= 'ensro';
-        $pass ||= '';
-        $host ||= '';
-        $port ||= 3306;
-    }
+    my $type                        = $conn_params->{'type'};
+    my $disconnect_when_inactive    = $conn_params->{'disconnect_when_inactive'};
+    my $no_sql_schema_version_check = $conn_params->{'no_sql_schema_version_check'};
 
-    my $type    = $conn_params->{'type'};
-    my $discon  = $conn_params->{'discon'};
-    my $nosqlvc = $conn_params->{'nosqlvc'};
-
-    my $connectionKey = "$driver://$user:$pass\@$host:$port/$dbname;$type";
+    my $connectionKey = $driver.'://'.($user//'').':'.($pass//'').'@'.($host//'').':'.($port//'').'/'.($dbname//'').';'.$type;
     my $dba = $_URLFactory_global_instance->{$connectionKey};
 
     unless($dba) {
@@ -165,9 +164,9 @@ sub create_cached_dba {
         $_URLFactory_global_instance->{$connectionKey} = $dba =
         $type eq 'hive'
           ? $module->new(
-            -url    => $dbconn_part,
-            -disconnect_when_inactive => $discon,
-            -no_sql_schema_version_check => $nosqlvc,
+            -url                        => $dbconn_part,
+            -disconnect_when_inactive   => $disconnect_when_inactive,
+            -no_sql_schema_version_check=> $no_sql_schema_version_check,
         ) : $module->new(
             -driver => $driver,
             -host   => $host,
@@ -176,7 +175,7 @@ sub create_cached_dba {
             -pass   => $pass,
             -dbname => $dbname,
             -species => $dbname,
-            -disconnect_when_inactive => $discon,
+            -disconnect_when_inactive => $disconnect_when_inactive,
         );
     }
     return $dba;

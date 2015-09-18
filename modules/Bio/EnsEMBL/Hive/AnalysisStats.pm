@@ -10,7 +10,7 @@
 
 =head1 LICENSE
 
-    Copyright [1999-2014] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
+    Copyright [1999-2015] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
 
     Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
     You may obtain a copy of the License at
@@ -36,11 +36,10 @@
 package Bio::EnsEMBL::Hive::AnalysisStats;
 
 use strict;
+use warnings;
 use List::Util 'sum';
 use POSIX;
-
-use Bio::EnsEMBL::Hive::Utils ('throw');
-use Bio::EnsEMBL::Hive::Analysis;
+use Term::ANSIColor;
 
 use base ( 'Bio::EnsEMBL::Hive::Cacheable', 'Bio::EnsEMBL::Hive::Storable' );
 
@@ -124,12 +123,6 @@ sub num_running_workers {
     return $self->{'_num_running_workers'};
 }
 
-sub num_required_workers {      # NB: the meaning of this field is, again, "how many extra workers we need to add"
-    my $self = shift;
-    $self->{'_num_required_workers'} = shift if(@_);
-    return $self->{'_num_required_workers'};
-}
-
 
 ## dynamic hive_capacity mode attributes:
 
@@ -187,16 +180,22 @@ sub avg_output_msec_per_job {
 
 ## other storable attributes:
 
-sub last_update {                   # this method is called by the initial store() [at which point it returns undef]
+sub when_updated {                   # this method is called by the initial store() [at which point it returns undef]
     my $self = shift;
-    $self->{'_last_update'} = shift if(@_);
-    return $self->{'_last_update'};
+    $self->{'_when_updated'} = shift if(@_);
+    return $self->{'_when_updated'};
 }
 
-sub seconds_since_last_update {     # this method is mostly used to convert between server time and local time
+sub seconds_since_when_updated {     # we fetch the server difference, store local time in the memory object, and use the local difference
     my( $self, $value ) = @_;
-    $self->{'_last_update'} = time() - $value if(defined($value));
-    return time() - $self->{'_last_update'};
+    $self->{'_when_updated'} = time() - $value if(defined($value));
+    return defined($self->{'_when_updated'}) ? time() - $self->{'_when_updated'} : undef;
+}
+
+sub seconds_since_last_fetch {      # track the freshness of the object (store local time, use the local difference)
+    my( $self, $value ) = @_;
+    $self->{'_last_fetch'} = time() - $value if(defined($value));
+    return defined($self->{'_last_fetch'}) ? time() - $self->{'_last_fetch'} : undef;
 }
 
 sub sync_lock {
@@ -210,10 +209,15 @@ sub sync_lock {
 
 
 sub refresh {
-    my $self = shift;
+    my ($self, $seconds_fresh)      = @_;
+    my $seconds_since_last_fetch    = $self->seconds_since_last_fetch;
 
-    return $self->adaptor && $self->adaptor->refresh($self);
+    if( $self->adaptor
+    and (!defined($seconds_fresh) or !defined($seconds_since_last_fetch) or $seconds_fresh < $seconds_since_last_fetch) ) {
+        return $self->adaptor->refresh($self);
+    }
 }
+
 
 sub update {
     my $self = shift;
@@ -225,25 +229,68 @@ sub update {
 
 
 sub get_or_estimate_batch_size {
-    my $self = shift;
+    my $self                = shift @_;
+    my $remaining_job_count = shift @_ || 0;    # FIXME: a better estimate would be $self->claimed_job_count when it is introduced
 
-    if( (my $batch_size = $self->batch_size())>0 ) {        # set to positive or not set (and auto-initialized within $self->batch_size)
+    my $batch_size = $self->batch_size;
 
-        return $batch_size;
+    if( $batch_size > 0 ) {        # set to positive or not set (and auto-initialized within $self->batch_size)
+
                                                         # otherwise it is a request for dynamic estimation:
-    } elsif( my $avg_msec_per_job = $self->avg_msec_per_job() ) {           # further estimations from collected stats
+    } elsif( my $avg_msec_per_job = $self->avg_msec_per_job ) {           # further estimations from collected stats
 
         $avg_msec_per_job = 100 if($avg_msec_per_job<100);
 
-        return POSIX::ceil( $self->min_batch_time() / $avg_msec_per_job );
+        $batch_size = POSIX::ceil( $self->min_batch_time / $avg_msec_per_job );
 
     } else {        # first estimation when no stats are available (take -$batch_size as first guess, if not zero)
-        return -$batch_size || 1;
+        $batch_size = -$batch_size || 1;
     }
+
+        # TailTrimming correction aims at meeting the requirement half way:
+    if( my $num_of_workers = POSIX::ceil( ($self->num_running_workers + $self->estimate_num_required_workers($remaining_job_count))/2 ) ) {
+
+        my $jobs_to_do  = $self->ready_job_count + $remaining_job_count;
+
+        my $tt_batch_size = POSIX::floor( $jobs_to_do / $num_of_workers );
+        if( (0 < $tt_batch_size) && ($tt_batch_size < $batch_size) ) {
+            $batch_size = $tt_batch_size;
+        } elsif(!$tt_batch_size) {
+            $batch_size = POSIX::ceil( $jobs_to_do / $num_of_workers ); # essentially, 0 or 1
+        }
+    }
+
+
+    return $batch_size;
 }
 
 
-sub inprogress_job_count {
+sub estimate_num_required_workers {     # this 'max allowed' total includes the ones that are currently running
+    my $self                = shift @_;
+    my $remaining_job_count = shift @_ || 0;    # FIXME: a better estimate would be $self->claimed_job_count when it is introduced
+
+    my $num_required_workers = $self->ready_job_count + $remaining_job_count;   # this 'max' estimation can still be zero
+
+    my $h_cap = $self->hive_capacity;
+    if( defined($h_cap) and $h_cap>=0) {  # what is the currently attainable maximum defined via hive_capacity?
+        my $hive_current_load = $self->adaptor ? $self->adaptor->db->get_RoleAdaptor->get_hive_current_load() : 0;
+        my $h_max = $self->num_running_workers + POSIX::floor( $h_cap * ( 1.0 - $hive_current_load ) );
+        if($h_max < $num_required_workers) {
+            $num_required_workers = $h_max;
+        }
+    }
+    my $a_max = $self->analysis->analysis_capacity;
+    if( defined($a_max) and $a_max>=0 ) {   # what is the currently attainable maximum defined via analysis_capacity?
+        if($a_max < $num_required_workers) {
+            $num_required_workers = $a_max;
+        }
+    }
+
+    return $num_required_workers;
+}
+
+
+sub inprogress_job_count {      # includes CLAIMED
     my $self = shift;
     return    $self->total_job_count
             - $self->semaphored_job_count
@@ -252,51 +299,115 @@ sub inprogress_job_count {
             - $self->failed_job_count;
 }
 
+my %meta_status_2_color = (
+    'DONE'      => 'bright_cyan',
+    'RUNNING'   => 'bright_yellow',
+    'READY'     => 'bright_green',
+    'BLOCKED'   => 'black on_white',
+    'EMPTY'     => 'clear',
+    'FAILED'    => 'red',
+);
+
+# "Support for colors 8 through 15 (the bright_ variants) was added in
+# Term::ANSIColor 3.00, included in Perl 5.13.3."
+# http://perldoc.perl.org/Term/ANSIColor.html#COMPATIBILITY
+if ($Term::ANSIColor::VERSION < '3.00') {
+    foreach my $s (keys %meta_status_2_color) {
+        my $c = $meta_status_2_color{$s};
+        $c =~ s/bright_//;
+        $meta_status_2_color{$s} = $c;
+    }
+}
+
+my %analysis_status_2_meta_status = (
+    'LOADING'       => 'READY',
+    'SYNCHING'      => 'READY',
+    'ALL_CLAIMED'   => 'BLOCKED',
+    'WORKING'       => 'RUNNING',
+);
+
+my %count_method_2_meta_status = (
+    'semaphored_job_count'  => 'BLOCKED',
+    'ready_job_count'       => 'READY',
+    'inprogress_job_count'  => 'RUNNING',
+    'done_job_count'        => 'DONE',
+    'failed_job_count'      => 'FAILED',
+);
+
+sub _text_with_status_color {
+    my $field_size = shift;
+    my $color_enabled = shift;
+
+    my $padding = ($field_size and length($_[0]) < $field_size) ? ' ' x ($field_size - length($_[0])) : '';
+    return $padding . ($color_enabled ? color($meta_status_2_color{$_[1]}).$_[0].color('reset') : $_[0]);
+}
+
 
 sub job_count_breakout {
     my $self = shift;
+    my $field_size = shift;
+    my $color_enabled = shift;
 
+    my $this_length = 0;
     my @count_list = ();
     my %count_hash = ();
     my $total_job_count = $self->total_job_count();
     foreach my $count_method (qw(semaphored_job_count ready_job_count inprogress_job_count done_job_count failed_job_count)) {
         if( my $count = $count_hash{$count_method} = $self->$count_method() ) {
-            push @count_list, $count.substr($count_method,0,1);
+            $this_length += length("$count") + 1;
+            push @count_list, _text_with_status_color(undef, $color_enabled, $count, $count_method_2_meta_status{$count_method}).substr($count_method,0,1);
         }
     }
     my $breakout_label = join('+', @count_list);
+    $this_length += scalar(@count_list)-1 if @count_list;
     $breakout_label .= '='.$total_job_count if(scalar(@count_list)!=1); # only provide a total if multiple or no categories available
+    $this_length += 1+length("$total_job_count") if(scalar(@count_list)!=1);
+
+    $breakout_label = ' ' x ($field_size - $this_length) . $breakout_label if $field_size and $this_length<$field_size;
 
     return ($breakout_label, $total_job_count, \%count_hash);
 }
 
+sub friendly_avg_job_runtime {
+    my $self = shift;
+
+    my $avg = $self->avg_msec_per_job;
+    my @units = ([24*3600*1000, 'day'], [3600*1000, 'hr'], [60*1000, 'min'], [1000, 'sec']);
+
+    while (my $unit_description = shift @units) {
+        my $x = $avg / $unit_description->[0];
+        if ($x >= 1.) {
+            return ($x, $unit_description->[1]);
+        }
+    }
+    return ($avg, 'ms');
+}
 
 sub toString {
     my $self = shift @_;
+    my $max_logic_name_length = shift || 40;
 
-    my $analysis = $self->analysis;
+    my $can_do_colour                                   = (-t STDOUT ? 1 : 0);
+    my ($breakout_label, $total_job_count, $count_hash) = $self->job_count_breakout(24, $can_do_colour);
+    my $analysis                                        = $self->analysis;
+    my ($avg_runtime, $avg_runtime_unit)                = $self->friendly_avg_job_runtime;
 
-    my $output .= sprintf("%-27s(%2d) %11s jobs(Sem:%d, Rdy:%d, InProg:%d, Done+Pass:%d, Fail:%d)=%d Ave_msec:%d, workers(Running:%d, Reqired:%d) ",
+    my $output .= sprintf("%-${max_logic_name_length}s(%3d) %s, jobs( %s ), avg:%5.1f %-3s, workers(Running:%d, Est.Required:%d) ",
         $analysis->logic_name,
-        $self->analysis_id,
+        $self->analysis_id // 0,
 
-        $self->status,
+        _text_with_status_color(11, $can_do_colour, $self->status, $analysis_status_2_meta_status{$self->status} || $self->status),
 
-        $self->semaphored_job_count,
-        $self->ready_job_count,
-        $self->inprogress_job_count,
-        $self->done_job_count,
-        $self->failed_job_count,
-        $self->total_job_count,
+        $breakout_label,
 
-        $self->avg_msec_per_job,
+        $avg_runtime, $avg_runtime_unit,
 
         $self->num_running_workers,
-        $self->num_required_workers,
+        $self->estimate_num_required_workers,
     );
-    $output .=  '  h.cap:'    .( defined($self->hive_capacity) ? $self->hive_capacity : '-' )
-               .'  a.cap:'    .( defined($analysis->analysis_capacity) ? $analysis->analysis_capacity : '-')
-               ."  (sync'd "  .$self->seconds_since_last_update." sec ago)";
+    $output .=  '  h.cap:'    .( $self->hive_capacity // '-' )
+               .'  a.cap:'    .( $analysis->analysis_capacity // '-')
+               ."  (sync'd "  .($self->seconds_since_when_updated // 0)." sec ago)";
 
     return $output;
 }
@@ -386,17 +497,9 @@ sub recalculate_from_job_counts {
         $self->semaphored_job_count( $job_counts->{'SEMAPHORED'} || 0 );
         $self->ready_job_count(      $job_counts->{'READY'} || 0 );
         $self->failed_job_count(     $job_counts->{'FAILED'} || 0 );
-        $self->done_job_count(       $job_counts->{'DONE'} + $job_counts->{'PASSED_ON'} || 0 ); # done here or potentially done elsewhere
+        $self->done_job_count(       ( $job_counts->{'DONE'} // 0 ) + ($job_counts->{'PASSED_ON'} // 0 ) ); # done here or potentially done elsewhere
         $self->total_job_count(      sum( values %$job_counts ) || 0 );
     }
-
-        # compute the number of total required workers for this analysis (taking into account the jobs that are already running)
-    my $analysis              = $self->analysis();
-    my $scheduling_allowed    =  ( !defined( $self->hive_capacity ) or $self->hive_capacity )
-                              && ( !defined( $analysis->analysis_capacity  ) or $analysis->analysis_capacity  );
-    my $required_workers    = $scheduling_allowed
-                            && POSIX::ceil( $self->ready_job_count() / $self->get_or_estimate_batch_size() );
-    $self->num_required_workers( $required_workers );
 
     $self->check_blocking_control_rules();
 

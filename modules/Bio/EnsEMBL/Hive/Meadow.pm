@@ -12,7 +12,7 @@
 
 =head1 LICENSE
 
-    Copyright [1999-2014] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
+    Copyright [1999-2015] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
 
     Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
     You may obtain a copy of the License at
@@ -99,12 +99,10 @@ sub job_name_prefix {
 }
 
 
-sub generate_job_name {
-    my ($self, $worker_count, $iteration, $rc_name) = @_;
+sub job_array_common_name {
+    my ($self, $rc_name, $iteration) = @_;
 
-    return $self->job_name_prefix()
-        ."${rc_name}-${iteration}"
-        . (($worker_count > 1) ? "[1-${worker_count}]" : '');
+    return $self->job_name_prefix() ."${rc_name}-${iteration}";
 }
 
 

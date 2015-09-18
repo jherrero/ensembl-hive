@@ -22,7 +22,7 @@
 
 =head1 LICENSE
 
-    Copyright [1999-2014] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
+    Copyright [1999-2015] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
 
     Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
     You may obtain a copy of the License at
@@ -66,9 +66,7 @@ sub default_options {
     return {
         %{ $self->SUPER::default_options() },               # inherit other stuff from the base class
 
-        'pipeline_name' => 'failure_test',                  # name used by the beekeeper to prefix job names on the farm
-
-        'job_count'         => 20,                          # controls the total number of FailureTest jobs
+        'job_count'         => 10,                          # controls the total number of FailureTest jobs
         'failure_rate'      =>  3,                          # controls the rate of jobs that are programmed to fail
         'state'             => 'RUN',                       # controls in which state the jobs are programmed to fail
         'lethal_after'      => 0,
@@ -92,7 +90,7 @@ sub pipeline_analyses {
         {   -logic_name => 'generate_jobs',
             -module     => 'Bio::EnsEMBL::Hive::RunnableDB::JobFactory',
             -parameters => {
-                'inputlist'    => '#expr([0..$job_count-1])expr#',    # this expression will evaluate into a listref
+                'inputlist'    => '#expr([0..#job_count#-1])expr#',    # this expression will evaluate into a listref
                 'column_names' => [ 'value' ],
             },
             -input_ids => [

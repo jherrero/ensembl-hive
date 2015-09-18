@@ -42,7 +42,7 @@
 
 =head1 LICENSE
 
-    Copyright [1999-2014] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
+    Copyright [1999-2015] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
 
     Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
     You may obtain a copy of the License at
@@ -81,7 +81,7 @@ sub pipeline_create_commands {
         @{$self->SUPER::pipeline_create_commands},  # inheriting database and hive tables' creation
 
             # additional tables needed for long multiplication pipeline's operation:
-        $self->db_cmd('CREATE TABLE final_result (a_multiplier char(40) NOT NULL, b_multiplier char(40) NOT NULL, result char(80) NOT NULL, PRIMARY KEY (a_multiplier, b_multiplier))'),
+        $self->db_cmd('CREATE TABLE final_result (a_multiplier varchar(255) NOT NULL, b_multiplier varchar(255) NOT NULL, result varchar(255) NOT NULL, PRIMARY KEY (a_multiplier, b_multiplier))'),
     ];
 }
 
@@ -150,8 +150,6 @@ sub pipeline_analyses {
         
         {   -logic_name => 'add_together',
             -module     => 'Bio::EnsEMBL::Hive::RunnableDB::LongMult::AddTogether',
-#           -analysis_capacity  =>  0,  # this is a way to temporarily block a given analysis
-            -wait_for => [ 'part_multiply' ],
             -flow_into => {
                 1 => [ ':////final_result' ],
             },

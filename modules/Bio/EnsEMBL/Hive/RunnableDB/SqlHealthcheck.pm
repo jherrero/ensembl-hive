@@ -24,7 +24,7 @@
 
 =head1 LICENSE
 
-    Copyright [1999-2014] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
+    Copyright [1999-2015] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
 
     Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
     You may obtain a copy of the License at
@@ -52,7 +52,9 @@ use base ('Bio::EnsEMBL::Hive::Process');
 
 sub param_defaults {
     return {
-        description => '/no description/',
+        'description'   => '/no description/',
+        'expected_size' => undef,
+        'inputquery'    => undef,
     }
 }
 
@@ -116,7 +118,13 @@ sub run {
     foreach my $test (@{$self->param('tests')}) {
         push @failures, $test unless $self->_run_test($test);
     }
-    die "The following tests have failed:\n".join('', map {sprintf(" - %s\n   > %s\n", $_->{description}, $_->{subst_query})} @failures) if @failures;
+    if (@failures) {
+        # Transient errors like lost access to the database, etc, tend to
+        # make the job die in _run_test(). If we've passed this point, the
+        # test geneuinely failed, and it will fail again anyway
+        $self->input_job->transient_error(0);
+        die "The following tests have failed:\n".join('', map {sprintf(" - %s\n   > %s\n", $_->{description}, $_->{subst_query})} @failures);
+    }
 }
 
 
@@ -151,8 +159,9 @@ sub _run_test {
     $query .= " LIMIT $maxrow" unless $query =~ /LIMIT/i;
     print "Query: $query\n";
 
-    my $sth = $self->data_dbc()->prepare($query);
-    $sth->{mysql_use_result} = 1 if $self->data_dbc->driver eq 'mysql';
+    my $sth_attribs = ($self->data_dbc->driver eq 'mysql') ? { 'mysql_use_result' => 1 } : {};
+
+    my $sth = $self->data_dbc()->prepare($query, $sth_attribs);
     $sth->execute();
 
     my $nrow = 0;

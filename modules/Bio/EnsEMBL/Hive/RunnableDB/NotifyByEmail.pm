@@ -25,7 +25,7 @@
 
 =head1 LICENSE
 
-    Copyright [1999-2014] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
+    Copyright [1999-2015] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
 
     Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
     You may obtain a copy of the License at
@@ -46,11 +46,13 @@
 package Bio::EnsEMBL::Hive::RunnableDB::NotifyByEmail;
 
 use strict;
+use warnings;
 
 use base ('Bio::EnsEMBL::Hive::Process');
 
 sub param_defaults {
     return {
+            'is_html'    => 0,
             'subject' => 'An automatic message from your pipeline',
     };
 }
@@ -77,6 +79,8 @@ sub fetch_input {
 
     param('text'):    Text of the email message. It will undergo parameter substitution.
 
+    param('is_html'): Boolean. Whether the content of 'text' is in HTML
+
     param('*'):       Any other parameters can be freely used for parameter substitution.
 
 =cut
@@ -88,11 +92,12 @@ sub run {
     my $subject = $self->param_required('subject');
     my $text    = $self->param_required('text');
 
-    open(SENDMAIL, "|sendmail $email");
-    print SENDMAIL "Subject: $subject\n";
-    print SENDMAIL "\n";
-    print SENDMAIL "$text\n";
-    close SENDMAIL;
+    open(my $sendmail_fh, '|-', "sendmail '$email'");
+    print $sendmail_fh "Subject: $subject\n";
+    print $sendmail_fh "Content-Type: text/html;\n" if $self->param('is_html');
+    print $sendmail_fh "\n";
+    print $sendmail_fh "$text\n";
+    close $sendmail_fh;
 }
 
 =head2 write_output

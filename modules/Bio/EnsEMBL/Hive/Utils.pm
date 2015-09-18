@@ -1,3 +1,4 @@
+
 =pod
 
 =head1 NAME
@@ -30,7 +31,7 @@
 
 =head1 LICENSE
 
-    Copyright [1999-2014] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
+    Copyright [1999-2015] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
 
     Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
     You may obtain a copy of the License at
@@ -54,12 +55,11 @@ use strict;
 use warnings;
 use Carp ('confess');
 use Data::Dumper;
-use Bio::EnsEMBL::Hive::Version;
-use Bio::EnsEMBL::Hive::DBSQL::SqlSchemaAdaptor;
+use Scalar::Util qw(looks_like_number);
 #use Bio::EnsEMBL::Hive::DBSQL::DBConnection;   # causes warnings that all exported functions have been redefined
 
 use Exporter 'import';
-our @EXPORT_OK = qw(stringify destringify dir_revhash parse_cmdline_options find_submodules load_file_or_module script_usage url2dbconn_hash go_figure_dbc report_versions throw);
+our @EXPORT_OK = qw(stringify destringify dir_revhash parse_cmdline_options find_submodules load_file_or_module script_usage url2dbconn_hash go_figure_dbc report_versions throw join_command_args);
 
 no warnings ('once');   # otherwise the next line complains about $Carp::Internal being used just once
 $Carp::Internal{ (__PACKAGE__) }++;
@@ -84,7 +84,7 @@ sub stringify {
     local $Data::Dumper::Quotekeys = 1;         # conserve some space
     local $Data::Dumper::Useqq     = 1;         # escape the \n and \t correctly
     local $Data::Dumper::Pair      = ' => ';    # make sure we always produce Perl-parsable structures, no matter what is set externally
-    local $Data::Dumper::Maxdepth  = undef;     # make sure nobody can mess up stringification by setting a lower Maxdepth
+    local $Data::Dumper::Maxdepth  = 0;         # make sure nobody can mess up stringification by setting a lower Maxdepth
 
     return Dumper($structure);
 }
@@ -103,11 +103,12 @@ sub stringify {
 sub destringify {
     my $value = pop @_;
 
-    if($value) {
+    if(defined $value) {
         if($value=~/^'.*'$/
         or $value=~/^".*"$/
         or $value=~/^{.*}$/
         or $value=~/^\[.*\]$/
+        or looks_like_number($value)    # Needed for pipeline_wide_parameters as each value is destringified independently and the JSON writer would otherwise force writing numbers as strings
         or $value eq 'undef') {
 
             $value = eval($value);
@@ -296,7 +297,7 @@ sub url2dbconn_hash {
 
 
 sub go_figure_dbc {
-    my ($foo, $schema_type) = @_;
+    my ($foo, $reg_type) = @_;      # NB: the second parameter is used by a Compara Runnable
 
 #    if(UNIVERSAL::isa($foo, 'Bio::EnsEMBL::DBSQL::DBConnection')) { # already a DBConnection, return it:
     if ( ref($foo) =~ /DBConnection$/ ) {   # already a DBConnection, return it:
@@ -320,13 +321,29 @@ sub go_figure_dbc {
     } else {
         unless(ref($foo)) {    # maybe it is simply a registry key?
             my $dba;
+
             eval {
-                $schema_type ||= 'hive';
                 require Bio::EnsEMBL::Registry;
-                $dba = Bio::EnsEMBL::Registry->get_DBAdaptor($foo, $schema_type);
+
+                if($foo=~/^(\w+):(\w+)$/) {
+                    ($reg_type, $foo) = ($1, $2);
+                }
+
+                if($reg_type) {
+                    $dba = Bio::EnsEMBL::Registry->get_DBAdaptor($foo, $reg_type);
+                } else {
+                    my $dbas = Bio::EnsEMBL::Registry->get_all_DBAdaptors(-species => $foo);
+
+                    if( scalar(@$dbas) == 1 ) {
+                        $dba = $dbas->[0];
+                    } elsif( @$dbas ) {
+                        warn "The registry contains multiple entries for '$foo', please prepend the reg_alias with the desired type";
+                    }
+                }
             };
+
             if(UNIVERSAL::can($dba, 'dbc')) {
-                return $dba->dbc;
+                return bless $dba->dbc, 'Bio::EnsEMBL::Hive::DBSQL::DBConnection';
             }
         }
         die "Sorry, could not figure out how to make a DBConnection object out of '$foo'";
@@ -335,8 +352,12 @@ sub go_figure_dbc {
 
 
 sub report_versions {
+    require Bio::EnsEMBL::Hive::Version;
+    require Bio::EnsEMBL::Hive::DBSQL::SqlSchemaAdaptor;
+    require Bio::EnsEMBL::Hive::GuestProcess;
     print "CodeVersion\t".Bio::EnsEMBL::Hive::Version->get_code_version()."\n";
     print "CompatibleHiveDatabaseSchemaVersion\t".Bio::EnsEMBL::Hive::DBSQL::SqlSchemaAdaptor->get_code_sql_schema_version()."\n";
+    print "CompatibleGuestLanguageCommunicationProtocolVersion\t".Bio::EnsEMBL::Hive::GuestProcess->get_protocol_version()."\n";
 }
 
 
@@ -346,6 +367,43 @@ sub throw {
         # TODO: newer versions of Carp are much more tunable, but I am stuck with v1.08 .
         #       Alternatively, we could implement our own stack reporter instead of Carp::confess.
     confess $msg;
+}
+
+
+=head2 join_command_args
+
+    Argument[0]: String or Arrayref of Strings
+    Description: Prepares the command to be executed by system(). It is needed if the
+                 command is in fact composed of multiple commands.
+    Returns:     Tuple (boolean,string). The boolean indicates whether it was needed to
+                 join the arguments. The string is the new command-line string.
+                 PS: Shamelessly adapted from http://www.perlmonks.org/?node_id=908096
+
+=cut
+
+my %shell_characters = map {$_ => 1} qw(< > |);
+
+sub join_command_args {
+    my $args = shift;
+    return (0,$args) unless ref($args);
+
+    # system() can only spawn 1 process. For multiple commands piped
+    # together or if redirections are used, we need a shell to parse
+    # a joined string representing the command
+    my $join_needed = (grep {$shell_characters{$_}} @$args) ? 1 : 0;
+
+    my @new_args = ();
+    foreach my $a (@$args) {
+        if ($shell_characters{$a} or $a =~ /^[a-zA-Z0-9_\-]+\z/) {
+            push @new_args, $a;
+        } else {
+            # Escapes the single-quotes and protects the arguments
+            $a =~ s/'/'\\''/g;
+            push @new_args, "'$a'";
+        }
+    }
+
+    return ($join_needed,join(' ', @new_args));
 }
 
 

@@ -16,7 +16,7 @@
 
 =head1 LICENSE
 
-    Copyright [1999-2014] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
+    Copyright [1999-2015] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
 
     Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
     You may obtain a copy of the License at
@@ -37,6 +37,7 @@
 package Bio::EnsEMBL::Hive::RunnableDB::LongMult::AddTogether;
 
 use strict;
+use warnings;
 
 use base ('Bio::EnsEMBL::Hive::Process');
 
@@ -78,9 +79,8 @@ sub fetch_input {   # fetch all the (relevant) precomputed products
     my $partial_product;
 
     if($intermediate_table_name) {      # special compatibility mode, where data is fetched from a given table
-        my $adaptor = $self->db->get_NakedTableAdaptor();
-        $adaptor->table_name( $intermediate_table_name );
-        $partial_product = $self->param('partial_product', $adaptor->fetch_by_a_multiplier_HASHED_FROM_digit_TO_partial_product( $a_multiplier ) );
+        my $intermediate_table_adaptor = $self->db->get_NakedTableAdaptor( 'table_name' => $intermediate_table_name );
+        $partial_product = $self->param('partial_product', $intermediate_table_adaptor->fetch_by_a_multiplier_HASHED_FROM_digit_TO_partial_product( $a_multiplier ) );
     } else {
         $partial_product = $self->param('partial_product');
     }
@@ -107,6 +107,7 @@ sub run {   # call the function that will compute the stuff
     sleep( $self->param('take_time') );
 }
 
+
 =head2 write_output
 
     Description : Implements write_output() interface method of Bio::EnsEMBL::Hive::Process that is used to deal with job's output after the execution.
@@ -114,13 +115,35 @@ sub run {   # call the function that will compute the stuff
 
 =cut
 
-
 sub write_output {  # store and dataflow
     my $self = shift @_;
 
     $self->dataflow_output_id({
         'result'       => $self->param('result'),
     }, 1);
+}
+
+
+=head2 post_healthcheck
+
+    Description : Implements post_healthcheck() interface method of Bio::EnsEMBL::Hive::Process that is used to healthcheck the result of the job's execution.
+                  Here it assumes (which is not general enough but ok for most of our cases) that the result will be deposited in 'final_result' table.
+                  Warning: it may stop working once you plug this runnable in a different PipeConfig.
+
+=cut
+
+sub post_healthcheck {
+    my $self = shift @_;
+
+    my $a_multiplier    = $self->param_required('a_multiplier');
+    my $b_multiplier    = $self->param_required('b_multiplier');
+
+    my $final_result_nta = $self->db->get_NakedTableAdaptor( 'table_name' => 'final_result' );
+    my $final_result = $final_result_nta->fetch_by_a_multiplier_AND_b_multiplier_TO_result( $a_multiplier, $b_multiplier);
+
+    my $correct_or_not = ($a_multiplier * $b_multiplier == $final_result) ? 'CORRECT' : 'INCORRECT';
+
+    $self->warning("The result stored in 'final_result' table for ${a_multiplier} x ${b_multiplier} is $final_result, this result is $correct_or_not");
 }
 
 

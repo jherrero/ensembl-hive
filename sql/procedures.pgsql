@@ -7,7 +7,7 @@ DESCRIPTION
 
 LICENSE
 
-    Copyright [1999-2014] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
+    Copyright [1999-2015] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
 
     Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
     You may obtain a copy of the License at
@@ -58,8 +58,8 @@ CREATE OR REPLACE VIEW progress AS
 CREATE OR REPLACE VIEW msg AS
     SELECT a.analysis_id, a.logic_name, m.*
     FROM log_message m
-    LEFT JOIN job j ON (j.job_id=m.job_id)
-    LEFT JOIN analysis_base a ON (a.analysis_id=j.analysis_id);
+    LEFT JOIN role USING (role_id)
+    LEFT JOIN analysis_base a USING (analysis_id);
 
 
 -- show statistics of Workers' real resource usage by analysis -------------------------------------------
@@ -74,12 +74,51 @@ CREATE OR REPLACE VIEW resource_usage_stats AS
            rc.name || '(' || rc.resource_class_id || ')' resource_class,
            u.exit_status,
            count(*) workers,
-           min(mem_megs) AS min_mem_megs, avg(mem_megs) AS avg_mem_megs, max(mem_megs) AS max_mem_megs,
-           min(swap_megs) AS min_swap_megs, avg(swap_megs) AS avg_swap_megs, max(swap_megs) AS max_swap_megs
-    FROM analysis_base a
-    JOIN resource_class rc USING(resource_class_id)
-    LEFT JOIN worker w USING(analysis_id)
+           min(mem_megs) AS min_mem_megs, round(avg(mem_megs)*100)/100 AS avg_mem_megs, max(mem_megs) AS max_mem_megs,
+           min(swap_megs) AS min_swap_megs, round(avg(swap_megs)*100)/100 AS avg_swap_megs, max(swap_megs) AS max_swap_megs
+    FROM resource_class rc
+    JOIN analysis_base a USING(resource_class_id)
+    LEFT JOIN role r USING(analysis_id)
+    LEFT JOIN worker w USING(worker_id)
     LEFT JOIN worker_resource_usage u USING (worker_id)
-    GROUP BY analysis_id, w.meadow_type, rc.resource_class_id, u.exit_status
-    ORDER BY analysis_id, w.meadow_type, rc.resource_class_id, u.exit_status;
+    GROUP BY a.analysis_id, w.meadow_type, rc.resource_class_id, u.exit_status
+    ORDER BY a.analysis_id, w.meadow_type, rc.resource_class_id, u.exit_status;
+
+
+-- show the roles that are currently live (grouped by meadow_users, resource_classes and analyses) -------
+--
+-- Usage:
+--       select * from live_roles;
+--       select * from live_roles where resource_class_id=12;
+
+CREATE OR REPLACE VIEW live_roles AS
+    SELECT w.meadow_user, w.meadow_type, w.resource_class_id, rc.name resource_class_name, r.analysis_id, a.logic_name, count(*)
+    FROM worker w
+    JOIN role r USING(worker_id)
+    LEFT JOIN resource_class rc ON w.resource_class_id=rc.resource_class_id
+    LEFT JOIN analysis_base a USING(analysis_id)
+    WHERE r.when_finished IS NULL
+    GROUP BY w.meadow_user, w.meadow_type, w.resource_class_id, rc.name, r.analysis_id, a.logic_name;
+
+
+-- time an analysis or group of analyses (given by a name pattern) ----------------------------------------
+--
+-- Usage:
+--      SELECT * FROM time_analysis();
+--      SELECT * FROM time_analysis('alignment_chains%');
+
+DROP FUNCTION IF EXISTS time_analysis(VARCHAR);
+CREATE FUNCTION time_analysis(analyses_pattern VARCHAR DEFAULT '%')
+RETURNS TABLE ( still_running BIGINT,
+                measured_in_minutes DOUBLE PRECISION,
+                measured_in_hours DOUBLE PRECISION,
+                measured_in_days DOUBLE PRECISION)
+AS $$
+    SELECT  COUNT(*)-COUNT(when_finished),
+            EXTRACT(EPOCH FROM (CASE WHEN COUNT(*)>COUNT(when_finished) THEN CURRENT_TIMESTAMP ELSE max(when_finished) END) - min(when_started))/60,
+            EXTRACT(EPOCH FROM (CASE WHEN COUNT(*)>COUNT(when_finished) THEN CURRENT_TIMESTAMP ELSE max(when_finished) END) - min(when_started))/3600,
+            EXTRACT(EPOCH FROM (CASE WHEN COUNT(*)>COUNT(when_finished) THEN CURRENT_TIMESTAMP ELSE max(when_finished) END) - min(when_started))/3600/24
+    FROM role JOIN analysis_base USING (analysis_id)
+    WHERE logic_name like $1;
+$$ LANGUAGE SQL;
 

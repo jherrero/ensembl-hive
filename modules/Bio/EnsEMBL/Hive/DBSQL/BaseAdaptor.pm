@@ -15,7 +15,7 @@
 
 =head1 LICENSE
 
-    Copyright [1999-2014] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
+    Copyright [1999-2015] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
 
     Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
     You may obtain a copy of the License at
@@ -36,8 +36,11 @@
 package Bio::EnsEMBL::Hive::DBSQL::BaseAdaptor;
 
 use strict;
+use warnings;
 no strict 'refs';   # needed to allow AUTOLOAD create new methods
 use DBI 1.6;        # the 1.6 functionality is important for detecting autoincrement fields and other magic.
+
+use Bio::EnsEMBL::Hive::Utils ('stringify', 'throw');
 
 
 sub default_table_name {
@@ -69,7 +72,8 @@ sub default_input_column_mapping {
 # ---------------------------------------------------------------------------
 
 sub new {
-    my ( $class, $dbobj ) = @_;
+    my $class   = shift @_;
+    my $dbobj   = shift @_;
 
     my $self = bless {}, $class;
 
@@ -84,6 +88,12 @@ sub new {
         $self->db( $dbobj );
     } else {
         throw("I was given [$dbobj] for a new adaptor");
+    }
+
+    my %flags = @_;
+
+    if(my $table_name = delete $flags{ 'table_name' }) {
+        $self->table_name( $table_name );
     }
 
     return $self;
@@ -220,20 +230,19 @@ sub _table_info_loader {
     my $table_name  = $self->table_name();
 
     my %column_set  = ();
-    my %name2type   = ();
     my $autoinc_id  = '';
     my @primary_key = $dbh->primary_key(undef, undef, $table_name);
 
     my $sth = $dbh->column_info(undef, undef, $table_name, '%');
     $sth->execute();
     while (my $row = $sth->fetchrow_hashref()) {
-        my ($position, $column_name, $column_type, $is_ai) = @$row{'ORDINAL_POSITION','COLUMN_NAME', 'TYPE_NAME', 'mysql_is_auto_increment'};
+        my ( $column_name, $column_type ) = @$row{'COLUMN_NAME', 'TYPE_NAME'};
 
-        $column_set{$column_name}  = 1;
-        $name2type{$column_name}   = $column_type;
+        # warn "ColumnInfo [$table_name/$column_name] = $column_type\n";
 
-        if( $is_ai  # careful! This is only supported by DBD::mysql and will not work with other drivers
-         or ($column_name eq $table_name.'_id')
+        $column_set{$column_name}  = $column_type;
+
+        if( ($column_name eq $table_name.'_id')
          or ($table_name eq 'analysis_base' and $column_name eq 'analysis_id') ) {    # a special case (historical)
             $autoinc_id = $column_name;
         }
@@ -247,25 +256,47 @@ sub _table_info_loader {
 
 
 sub count_all {
-    my ($self, $constraint) = @_;
+    my ($self, $constraint, $key_list) = @_;
 
     my $table_name      = $self->table_name();
 
-    my $sql = "SELECT COUNT(*) FROM $table_name";
+    my $sql = "SELECT ".($key_list ? join(', ', @$key_list, '') : '')."COUNT(*) FROM $table_name";
 
     if($constraint) {
             # in case $constraint contains any kind of JOIN (regular, LEFT, RIGHT, etc) do not put WHERE in front:
         $sql .= (($constraint=~/\bJOIN\b/i) ? ' ' : ' WHERE ') . $constraint;
     }
 
+    if($key_list) {
+        $sql .= " GROUP BY ".join(', ', @$key_list);
+    }
     # warn "SQL: $sql\n";
 
     my $sth = $self->prepare($sql);
-    $sth->execute;  
-    my ($count) = $sth->fetchrow_array();
-    $sth->finish;  
+    $sth->execute;
 
-    return $count;
+    my $result_struct;  # will be autovivified to the correct data structure
+
+    while(my $hashref = $sth->fetchrow_hashref) {
+
+        my $pptr = \$result_struct;
+        if($key_list) {
+            foreach my $syll (@$key_list) {
+                $pptr = \$$pptr->{$hashref->{$syll}};   # using pointer-to-pointer to enforce same-level vivification
+            }
+        }
+        $$pptr = $hashref->{'COUNT(*)'};
+    }
+
+    unless(defined($result_struct)) {
+        if($key_list and scalar(@$key_list)) {
+            $result_struct = {};
+        } else {
+            $result_struct = 0;
+        }
+    }
+
+    return $result_struct;
 }
 
 
@@ -309,6 +340,11 @@ sub fetch_all {
         my $object = $value_column
             ? $hashref->{$value_column}
             : $self->objectify($hashref);
+
+        if(UNIVERSAL::can($object, 'seconds_since_last_fetch')) {
+            $object->seconds_since_last_fetch(0);
+        }
+
         if($one_per_key) {
             $$pptr = $object;
         } else {
@@ -487,7 +523,7 @@ sub store {
     my $stored_this_time        = 0;
 
     foreach my $object (@$objects) {
-            my ($columns_being_stored, $column_key) = (ref($object) eq 'HASH') ? $self->keys_to_columns($object) : ($all_storable_columns, '*all*');
+            my ($columns_being_stored, $column_key) = $self->keys_to_columns($object);
             # warn "COLUMN_KEY='$column_key'\n";
 
             my $this_sth;
@@ -500,9 +536,9 @@ sub store {
                 $this_sth = $hashed_sth{$column_key} = $self->prepare( $sql ) or die "Could not prepare statement: $sql";
             }
 
-            # warn "STORED_COLUMNS: ".join(', ', map { "`$_`" } @$columns_being_stored)."\n";
+            # warn "STORED_COLUMNS: ".stringify($columns_being_stored)."\n";
             my $values_being_stored = $self->slicer( $object, $columns_being_stored );
-            # warn "STORED_VALUES: ".join(', ', map { "'$_'" } @$values_being_stored)."\n";
+            # warn "STORED_VALUES: ".stringify($values_being_stored)."\n";
 
             my $return_code = $this_sth->execute( @$values_being_stored )
                     # using $return_code in boolean context allows to skip the value '0E0' ('no rows affected') that Perl treats as zero but regards as true:
@@ -537,17 +573,23 @@ sub AUTOLOAD {
         my $column_set = $self->column_set();
 
         my $filter_components = $filter_string && [ split(/_AND_/i, $filter_string) ];
-        foreach my $column_name ( @$filter_components ) {
-            unless($column_set->{$column_name}) {
-                die "unknown column '$column_name'";
+        if($filter_components) {
+            foreach my $column_name ( @$filter_components ) {
+                unless($column_set->{$column_name}) {
+                    die "unknown column '$column_name'";
+                }
             }
         }
+
         my $key_components = $key_string && [ split(/_AND_/i, $key_string) ];
-        foreach my $column_name ( @$key_components ) {
-            unless($column_set->{$column_name}) {
-                die "unknown column '$column_name'";
+        if($key_components) {
+            foreach my $column_name ( @$key_components ) {
+                unless($column_set->{$column_name}) {
+                    die "unknown column '$column_name'";
+                }
             }
         }
+
         if($value_column && !$column_set->{$value_column}) {
             die "unknown column '$value_column'";
         }
@@ -556,7 +598,7 @@ sub AUTOLOAD {
         *$AUTOLOAD = sub {
             my $self = shift @_;
             return $self->fetch_all(
-                join(' AND ', map { "$filter_components->[$_]='$_[$_]'" } 0..scalar(@$filter_components)-1),
+                $filter_components && join(' AND ', map { "$filter_components->[$_]='$_[$_]'" } 0..scalar(@$filter_components)-1),
                 !$all,
                 $key_components,
                 $value_column
@@ -564,16 +606,28 @@ sub AUTOLOAD {
         };
         goto &$AUTOLOAD;    # restart the new method
 
-    } elsif($AUTOLOAD =~ /::count_all_by_(\w+)$/) {
-        my $filter_string = $1;
+    } elsif($AUTOLOAD =~ /::count_all(?:_by_(\w+?))?(?:_HASHED_FROM_(\w+?))?$/) {
+        my $filter_string   = $1;
+        my $key_string      = $2;
 
         my ($self) = @_;
         my $column_set = $self->column_set();
 
         my $filter_components = $filter_string && [ split(/_AND_/i, $filter_string) ];
-        foreach my $column_name ( @$filter_components ) {
-            unless($column_set->{$column_name}) {
-                die "unknown column '$column_name'";
+        if($filter_components) {
+            foreach my $column_name ( @$filter_components ) {
+                unless($column_set->{$column_name}) {
+                    die "unknown column '$column_name'";
+                }
+            }
+        }
+
+        my $key_components = $key_string && [ split(/_AND_/i, $key_string) ];
+        if($key_components) {
+            foreach my $column_name ( @$key_components ) {
+                unless($column_set->{$column_name}) {
+                    die "unknown column '$column_name'";
+                }
             }
         }
 
@@ -581,7 +635,8 @@ sub AUTOLOAD {
         *$AUTOLOAD = sub {
             my $self = shift @_;
             return $self->count_all(
-                join(' AND ', map { "$filter_components->[$_]='$_[$_]'" } 0..scalar(@$filter_components)-1),
+                $filter_components && join(' AND ', map { "$filter_components->[$_]='$_[$_]'" } 0..scalar(@$filter_components)-1),
+                $key_components,
             );
         };
         goto &$AUTOLOAD;    # restart the new method

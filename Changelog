@@ -1,3 +1,101 @@
+
+Version 2.3     - Spring 2015 edition
+===========
+
+Main highlights of the release:
+    API for Runnables written in "guest languages" (with reference Python implementation and examples)
+    Test suite (inspired by Roy's original pull request)
+    "TailTrimmer" [ in analyses with nontrivial batch sizes ] several techniques are now used to automatically decrease the batch size 
+        towards the end of the analysis in order to speed up the execution of the whole analysis
+    Stability improvements that significantly increase efficiency of parallel execution
+
+[ higher level features ]
+* support for Runnables written in Python3 and API for extending similar support to other languages (this API may still change)
+* coloured Beekeeper output - catches the eye!
+* SystemCmd now runs through Capture::Tiny , captures the error output from the actual command that gets stored in log_message
+* SystemCmd also knows how to capture MEMLIMIT events from the underlying Java code 
+* SystemCmd can map specific return codes to dataflow events
+* a new DbCmd runnable that mimics the behaviour of db_cmd.pl script ; you can also pipe data in or out of the connection to another system command
+* DbCmd, DatabaseDumper and MySQLTransfer runnable hide passwords in the command lines that they run
+* beekeeper.pl -unkwn option to clean up the workers found to be in UNKWN state (at the user's risk!)
+
+[ lower level features ]
+* record the 'meadow_user' in each Worker entry -- these values are also used when querying the Meadow to avoid running an equivalent of "-u all" in SGE Meadow
+* record the 'when_seen' timestamp in each Worker entry -- when the Worker was last seen as running by the Beekeeper process.
+* testing: introduced a Travis-integrated test suite loosely based on Roy's original pull request
+    -- the extended version tests direct API calls, runs individual Runnables (and tests their dataflow/warning events) or whole pipelines
+* testing: Travis runs tests against Hive databases stored in local MySQL, PostgreSQL and SQLite databases
+* stability [too many simultaneous queries] : detect and log deadlock collisions and retry them for a given number of times before failing
+* stability [running out of server connections] : try to resolve the "too many connections" situation by bouncing, waiting and retrying
+* stability [running out of local ports] : avoiding RELOCATED workers by applying incemental backoff-and-retry approach from Ethernet CSMA/CD protocol
+* stability [applying an incorrect patch] : schema patches now have internal SQL-based checks and should not cause much damage if applied in wrong order
+    + a new script to create such patches
+
+* the schema version changes to 73
+
+* multiple bug fixes, many of which have been ported to the previous version branches.
+
+
+Version 2.2     - 'analyses_pattern'
+===========
+
+* Running and maintenance of pipeline subsets has been made easy with -analyses_pattern option in beekeeper.pl
+    that understands ranges and additive/subtractive merging. You can refer to analyses in many different ways.
+    Examples:
+        -analyses_pattern 1..9                                  # show scheduling for a range of analysis_ids
+        -analyses_pattern 1..9,11..15   -run                    # run a scheduling iteration for two ranges of analysis_ids
+        -analyses_pattern fasta%        -sync                   # sync analyses matching a pattern
+        -analyses_pattern 1..9-5-report -loop                   # loop over a range except two analyses
+        -analyses_pattern 1..9,fasta%   -reset_all_jobs         # reset all jobs belonging to a range and a pattern
+        -analyses_pattern foo,bar,baz   -reset_failed_jobs      # reset failed jobs belonging to three analyses by names
+
+* The same option is available in runWorker.pl to constrain the set of analyses to specialize into (fully works with -can_respecialize 1 mode)
+
+* Detailed log of Scheduler's decision-making process is available
+
+* db_cmd.pl and SystemCmd.pm runnable have been reworked and are now better adapted for quoted arguments
+
+* Doxygen API documentation packaged with the code
+
+* Scripts' man pages converted into HTML and packaged with the code
+
+* New docs about installing eHive, running eHive and running MPI jobs with eHive
+
+* Using rawgit to render HTML docs hosted on GitHub (impossible otherwise)
+
+* No schema changes since version/2.1 : the same database should continue to work with newer code without patching
+
+
+Version 2.1     - 'multirole'
+===========
+
+* Improved internal API that allows implicit lazy-loading of objects associated with other objects via their dbIDs
+
+* Objects that make up pipeline's graph can be loaded into cache, which simplifies structural topup of existing pipeline databases
+
+* Diagram-drawing engine was stripped of its' dependence on dbIDs, so diagrams can now be built directly from PipeConfig file(s) using -pipeconfig option(s)
+
+* -analysis_topup removed (became the default mode of operation), -job_topup removed in favour of seed_pipeline.pl providing same functionality
+
+* pipeline_wide_parameters moved into a separate table, so hive-specific 'meta' table is no longer needed, and Ensembl's version can happily coexist
+
+* 'monitor' table removed in favour of offline generate_timeline.pl script (that does not require a constantly running beekeeper.pl for data generation)
+
+* pipeline_create_commands() is executed even on topup; redefine to return an empty list or use -hive_no_init if you don't need commands to be executed
+
+* Switched to 'worker_resource_usage' table, unified resource collection calls for other Meadows, so SGE/CONDOR/etc resources can be shown in guiHive & timeline.
+
+* Introduced 'role' table and Role objects to better track role-switching of multirole Workers
+
+* Added Process::complete_early() as the blessed way to exit the code early successfully and store a log_message
+
+* More careful semaphore rebalancing strategy that can also be switched on or off during pipeline database generation
+
+* Logging and error reporting has been improved and simplified
+
+* Multiple bugs have been fixed
+
+
 Version 2.0     - a major 'coreless' release of Hive code
 ===========
 

@@ -1,6 +1,6 @@
 =head1 LICENSE
 
-Copyright [1999-2013] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
+Copyright [1999-2015] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -68,6 +68,7 @@ the Bio::EnsEMBL::Registry and will not be instantiated directly.
 package Bio::EnsEMBL::Hive::DBSQL::CoreDBConnection;
 
 use strict;
+use warnings;
 
 use DBI;
 use Bio::EnsEMBL::Hive::DBSQL::StatementHandle;
@@ -112,14 +113,14 @@ BEGIN {
                  useful when running a lot of jobs on a compute farm
                  which would otherwise keep open a lot of connections to the
                  database.  Database connections are automatically reopened
-                 when required.Do not use this option together with RECONNECT_WHEN_CONNECTION_LOST.
+                 when required.Do not use this option together with RECONNECT_WHEN_LOST.
   Arg [WAIT_TIMEOUT]: (optional) integer
-                 Time in seconds for the wait timeout to happen. Time after which
+                 Time in seconds for the wait_timeout to happen. Time after which
                  the connection is deleted if not used. By default this is 28800 (8 hours)
                  on most systems. 
                  So set this to greater than this if your connection are getting deleted.
                  Only set this if you are having problems and know what you are doing.
-  Arg [RECONNECT_WHEN_CONNECTION_LOST]: (optional) boolean
+  Arg [RECONNECT_WHEN_LOST]: (optional) boolean
                  In case you're reusing the same database connection, i.e. DISCONNECT_WHEN_INACTIVE is 
                  set to false and running a job which takes a long time to process (over 8hrs), 
                  which means that the db connection may be lost, set this option to true. 
@@ -148,15 +149,15 @@ sub new {
     my %flags = @_;
 
     my ($driver, $user, $password, $host, $port, $dbname,
-        $dbconn, $disconnect_when_inactive, $wait_timeout, $reconnect_when_connection_lost)
+        $dbconn, $disconnect_when_inactive, $wait_timeout, $reconnect_when_lost)
      = @flags{qw(-driver -user -pass -host -port -dbname -dbconn
-                 -disconnect_when_inactive -wait_timeout -reconnect_when_connection_lost)};
+                 -disconnect_when_inactive -wait_timeout -reconnect_when_lost)};
 
     my $self = {};
     bless $self, $class;
 
   if($dbconn) {
-    if($dbname || $host || $driver || $password || $port || $disconnect_when_inactive || $reconnect_when_connection_lost) {
+    if($dbname || $host || $driver || $password || $port || $disconnect_when_inactive || $reconnect_when_lost) {
       throw("Cannot specify other arguments when -DBCONN argument used.");
     }
 
@@ -192,21 +193,19 @@ sub new {
         }
     }
 
-    $wait_timeout   ||= 0;
-
     $self->driver($driver);
     $self->host( $host );
     $self->port($port);
     $self->username( $user );
     $self->password( $password );
     $self->dbname( $dbname );
-    $self->timeout($wait_timeout);
+    $self->wait_timeout($wait_timeout);
 
     if($disconnect_when_inactive) {
       $self->disconnect_when_inactive($disconnect_when_inactive);
     }
-    if($reconnect_when_connection_lost) {
-      $self->reconnect_when_lost($reconnect_when_connection_lost);
+    if($reconnect_when_lost) {
+      $self->reconnect_when_lost($reconnect_when_lost);
     }
   }
 
@@ -308,13 +307,6 @@ sub connect {
                     $driver, $dbparam,
                     $self->host(),   $self->port() );
 
-    if ( $self->{'disconnect_when_inactive'} ) {
-      $self->{'count'}++;
-      if ( $self->{'count'} > 1000 ) {
-        sleep 1;
-        $self->{'count'} = 0;
-      }
-    }
     eval {
       $dbh = DBI->connect( $dsn, $self->username(), $self->password(),
                            { 'RaiseError' => 1 } );
@@ -342,8 +334,14 @@ sub connect {
 
   $self->db_handle($dbh);
 
-  if ( $self->timeout() ) {
-    $dbh->do( "SET SESSION wait_timeout=" . $self->timeout() );
+  if ( $self->wait_timeout() ) {
+    my $driver = $self->driver();
+
+    if( $driver eq 'mysql' ) {
+        $dbh->do( "SET SESSION wait_timeout=" . $self->wait_timeout() );
+    } else {
+        warn "Don't know how to set the wait_timeout for '$driver' driver, skipping.\n";
+    }
   }
 
   #print("CONNECT\n");
@@ -378,13 +376,13 @@ sub disconnect_count {
   return $self->{'disconnect_count'};
 }
 
-sub timeout{
+sub wait_timeout{
   my($self, $arg ) = @_;
 
   (defined $arg) &&
-    ($self->{_timeout} = $arg );
+    ($self->{_wait_timeout} = $arg );
 
-  return $self->{_timeout};
+  return $self->{_wait_timeout};
 
 }
 
@@ -756,11 +754,17 @@ sub prepare {
      throw("Attempting to prepare an empty SQL query.");
    }
 
-   #warn "SQL(".$self->dbname."):" . join(' ', @args) . "\n";
+   #warn "SQL(".$self->dbname."): " . join(' ', @args) . "\n";
    if ( ($self->reconnect_when_lost()) and (!$self->db_handle()->ping()) ) { 
        $self->reconnect();
    }
-   my $sth = $self->db_handle->prepare(@args);
+   my $sth;
+   eval {
+       $sth = $self->db_handle->prepare(@args);
+       1;
+   } or do {
+       throw( "FAILED_SQL(".$self->dbname."): " . join(' ', @args) );
+   };
 
    # return an overridden statement handle that provides us with
    # the means to disconnect inactive statement handles automatically
@@ -808,7 +812,7 @@ sub reconnect {
 =cut
 
 sub do {
-   my ($self,$string) = @_;
+   my ($self,$string, $attr, @bind_values) = @_;
 
    if( ! $string ) {
      throw("Attempting to do an empty SQL query.");
@@ -819,7 +823,7 @@ sub do {
    
    my $do_result = $self->work_with_db_handle(sub {
      my ($dbh) = @_;
-     my $result = eval { $dbh->do($string) };
+     my $result = eval { $dbh->do($string, $attr, @bind_values) };
      $error = $@ if $@;
      return $result;
    });
@@ -975,128 +979,6 @@ sub disconnect_if_idle {
   return 0;
 }
 
-
-=head2 add_limit_clause
-
-  Arg [1]    : string $sql
-  Arg [2]    : int $max_number
-  Example    : my $new_sql = $dbc->add_limit_clause($sql,$max_number);
-  Description: Giving an SQL statement, it adds a limit clause, dependent on the database 
-               (in MySQL, should add a LIMIT at the end, MSSQL uses a TOP clause)									 
-  Returntype : String containing the new valid SQL statement        
-  Exceptions : none
-  Caller     : general
-  Status     : at risk
-
-=cut
-
-
-sub add_limit_clause{
-    my $self = shift;
-    my $sql = shift;
-    my $max_number = shift;
-
-    my $new_sql = '';
-    if ($self->driver eq 'mysql'){
-        $new_sql = $sql . ' LIMIT ' . $max_number;
-    }
-    elsif ($self->driver eq 'odbc'){
-        #need to get anything after the SELECT statement
-        $sql =~ /select(.*)/i;
-        $new_sql = 'SELECT TOP ' . $max_number . $1;
-    }
-    else{
-        warn("Not possible to convert $sql to an unknow database driver: ", $self->driver, " no limit applied");
-        $new_sql = $sql;
-    }
-    return $new_sql;
-}
-
-
-=head2 from_date_to_seconds
-
-  Arg [1]    : date $date
-  Example    : my $string = $dbc->from_date_to_seconds($date);
-  Description: Giving a string representing a column of type date 
-                applies the database function to convert to the number of seconds from 01-01-1970
-  Returntype : string
-  Exceptions : none
-  Caller     : general
-  Status     : at risk
-
-=cut
-
-sub from_date_to_seconds{
-    my $self=  shift;
-    my $column = shift;
-
-    my $string;
-    if ($self->driver eq 'mysql'){
-        $string = "UNIX_TIMESTAMP($column)";
-    }
-    elsif ($self->driver eq 'odbc'){
-        $string = "DATEDIFF(second,'JAN 1 1970',$column)";
-    }
-    elsif ($self->driver eq 'SQLite'){
-        $string = "STRFTIME('%s', $column)";
-    }
-    else{
-        warn("Not possible to convert $column due to an unknown database driver: ", $self->driver);
-        return '';
-    }    
-    return $string;
-}
-
-
-=head2 from_seconds_to_date
-
-  Arg [1]    : int $seconds
-  Example    : my $string = $dbc->from_seconds_to_date($seconds);
-  Description: Giving an int representing number of seconds
-                applies the database function to convert to a date 
-  Returntype : string
-  Exceptions : none
-  Caller     : general
-  Status     : at risk
-
-=cut
-
-sub from_seconds_to_date{
-    my $self=  shift;
-    my $seconds = shift;
-
-    my $string;
-    if ($self->driver eq 'mysql'){
-        if ($seconds){
-            $string = "from_unixtime( ".$seconds.")";
-        }
-        else{
-            $string = "\"0000-00-00 00:00:00\"";
-        }
-    }
-    elsif ($self->driver eq 'odbc'){
-        if ($seconds){
-            $string = "DATEDIFF(date,'JAN 1 1970',$seconds)";
-        }
-        else{
-            $string = "\"0000-00-00 00:00:00\"";
-        }
-    }
-    elsif ($self->driver eq 'SQLite'){
-        if ($seconds){
-            $string = "DATETIME($seconds)";
-        }
-        else{
-            $string = "\"0000-00-00 00:00:00\"";
-        }
-    }
-    else{
-        warn("Not possible to convert $seconds due to an unknown database driver: ", $self->driver);
-        return '';
-
-    }    
-    return $string;
-}
 
 1;
 

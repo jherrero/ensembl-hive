@@ -10,7 +10,7 @@
 
 =head1 LICENSE
 
-    Copyright [1999-2014] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
+    Copyright [1999-2015] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
 
     Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
     You may obtain a copy of the License at
@@ -31,6 +31,7 @@
 package Bio::EnsEMBL::Hive::Meadow::LOCAL;
 
 use strict;
+use warnings;
 use Sys::Hostname;
 
 use base ('Bio::EnsEMBL::Hive::Meadow');
@@ -56,10 +57,18 @@ sub count_pending_workers_by_rc_name {
 }
 
 
+sub _command_line_to_extract_all_running_workers {
+    my ($self) = @_;
+
+        # Make sure we have excluded both 'awk' itself and commands like "less runWorker.pl" :
+    return q{ps x -o state,pid,command -w -w | awk '(/runWorker.pl/ && ($3 ~ /perl$/) )'};
+}
+
+
 sub count_running_workers {
     my $self = shift @_;
 
-    my $cmd = 'ps x | grep runWorker.pl | grep -v "grep runWorker.pl" | wc -l';
+    my $cmd = $self->_command_line_to_extract_all_running_workers . ' | wc -l';
     my $run_count = qx/$cmd/;
     chomp($run_count);
 
@@ -70,7 +79,7 @@ sub count_running_workers {
 sub status_of_all_our_workers { # returns a hashref
     my ($self) = @_;
 
-    my $cmd = 'ps x -o state,pid,command -w -w | grep runWorker.pl | grep -v "grep runWorker.pl" ';
+    my $cmd = $self->_command_line_to_extract_all_running_workers;
 
         # FIXME: if we want to incorporate Meadow->pipeline_name() filtering here,
         #        a dummy parameter to the runWorker.pl should probably be introduced
@@ -114,7 +123,7 @@ sub check_worker_is_alive_and_mine {
 
 
 sub kill_worker {
-    my $worker = pop @_;
+    my ($self, $worker, $fast) = @_;
 
     my $cmd = 'kill -9 '.$worker->process_id();
     system($cmd);
@@ -122,12 +131,12 @@ sub kill_worker {
 
 
 sub submit_workers {
-    my ($self, $worker_cmd, $required_worker_count, $iteration, $rc_name, $rc_specific_submission_cmd_args, $submit_stdout_file, $submit_stderr_file) = @_;
+    my ($self, $worker_cmd, $required_worker_count, $iteration, $rc_name, $rc_specific_submission_cmd_args, $submit_log_subdir) = @_;
 
     my $cmd = "$worker_cmd &";
 
     foreach (1..$required_worker_count) {
-        print "SUBMITTING_CMD:\t\t$rc_specific_submission_cmd_args $cmd\n";
+        print "Executing [ ".$self->signature." ] \t\t$cmd\n";
         system( $cmd );
     }
 }

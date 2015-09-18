@@ -16,7 +16,7 @@
 
 =head1 LICENSE
 
-    Copyright [1999-2014] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
+    Copyright [1999-2015] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
 
     Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
     You may obtain a copy of the License at
@@ -37,6 +37,7 @@
 package Bio::EnsEMBL::Hive::DBSQL::ObjectAdaptor;
 
 use strict;
+use warnings;
 
 use base ('Bio::EnsEMBL::Hive::DBSQL::BaseAdaptor');
 
@@ -69,7 +70,9 @@ sub objectify { # turn the hashref into an object (if only we could inline in Pe
 
     my $autoinc_id = $self->autoinc_id();
 
-    return $self->object_class()->new( 'adaptor' => $self, map { ( ($_ eq $autoinc_id) ? 'dbID' : $_ ) => $hashref->{$_} } keys %$hashref );
+    my $object = $self->object_class()->new( 'adaptor' => $self, map { ( ($_ eq $autoinc_id) ? 'dbID' : $_ ) => $hashref->{$_} } keys %$hashref );
+    $object->hive_pipeline($self->db->hive_pipeline) if $self->db->hive_pipeline and $object->can('hive_pipeline');
+    return $object;
 }
 
 
@@ -81,6 +84,17 @@ sub mark_stored {
     }
     $object->adaptor($self);
 }
+
+
+sub keys_to_columns {
+    my ($self, $object) = @_;
+
+    my $autoinc_id  = $self->autoinc_id();
+    my $sorted_keys = [ sort grep { ($_ ne $autoinc_id) and defined($object->$_()) } keys %{ $self->column_set() } ];
+
+    return ( $sorted_keys, join(', ', @$sorted_keys) );
+}
+
 
 
 1;

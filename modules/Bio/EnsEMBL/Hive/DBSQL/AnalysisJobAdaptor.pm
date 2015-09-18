@@ -16,7 +16,7 @@
 
 =head1 LICENSE
 
-    Copyright [1999-2014] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
+    Copyright [1999-2015] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
 
     Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
     You may obtain a copy of the License at
@@ -42,8 +42,8 @@
 package Bio::EnsEMBL::Hive::DBSQL::AnalysisJobAdaptor;
 
 use strict;
+use warnings;
 
-use Bio::EnsEMBL::Hive::DBSQL::AnalysisDataAdaptor;
 use Bio::EnsEMBL::Hive::AnalysisJob;
 use Bio::EnsEMBL::Hive::DBSQL::DataflowRuleAdaptor;
 use Bio::EnsEMBL::Hive::Utils ('stringify');
@@ -83,36 +83,43 @@ sub default_overflow_limit {
 sub store_jobs_and_adjust_counters {
     my ($self, $jobs, $push_new_semaphore) = @_;
 
-    my $dbc                                 = $self->dbc;
-
         # NB: our use patterns assume all jobs from the same storing batch share the same semaphored_job_id:
     my $semaphored_job_id                   = scalar(@$jobs) && $jobs->[0]->semaphored_job_id();
     my $need_to_increase_semaphore_count    = ($semaphored_job_id && !$push_new_semaphore);
 
-    my @output_job_ids  = ();
-    my $failed_to_store = 0;
+    my @output_job_ids              = ();
+    my $failed_to_store_local_jobs  = 0;
 
     foreach my $job (@$jobs) {
-            # avoid deadlocks when dataflowing under transactional mode (used in Ortheus Runnable for example):
-        $dbc->do( "SELECT 1 FROM job WHERE job_id=$semaphored_job_id FOR UPDATE" ) if($need_to_increase_semaphore_count and ($dbc->driver ne 'sqlite'));
 
-        my ($job, $stored_this_time) = $self->store( $job );
+        my $analysis    = $job->analysis;
+        my $job_adaptor = $analysis ? $analysis->adaptor->db->get_AnalysisJobAdaptor : $self;   # if analysis object is undefined, consider the job local
+        my $local_job   = $job_adaptor eq $self;
+
+            # avoid deadlocks when dataflowing under transactional mode (used in Ortheus Runnable for example):
+        if($need_to_increase_semaphore_count and $local_job and ($job_adaptor->dbc->driver ne 'sqlite')) {
+            $job_adaptor->dbc->do( "SELECT 1 FROM job WHERE job_id=$semaphored_job_id FOR UPDATE" );
+        }
+
+        $job->prev_job( undef ) unless( $local_job );   # break the link with the previous job if dataflowing across databases (current schema doesn't support URLs for job_ids)
+
+        my ($job, $stored_this_time) = $job_adaptor->store( $job );
 
         if($stored_this_time) {
-            if($need_to_increase_semaphore_count) { # if we are not creating a new semaphore (where dependent jobs have already been counted),
-                                                    # but rather propagating an existing one (same or other level), we have to up-adjust the counter
+            if($need_to_increase_semaphore_count and $local_job) {  # if we are not creating a new semaphore (where dependent jobs have already been counted),
+                                                                    # but rather propagating an existing one (same or other level), we have to up-adjust the counter
                 $self->increase_semaphore_count_for_jobid( $semaphored_job_id );
             }
 
-            unless($self->db->hive_use_triggers()) {
-                $dbc->do(qq{
+            unless($job_adaptor->db->hive_use_triggers()) {
+                $job_adaptor->dbc->do(qq{
                         UPDATE analysis_stats
                         SET total_job_count=total_job_count+1
                     }
                     .(($job->status eq 'READY')
                         ? " ,ready_job_count=ready_job_count+1 "
                         : " ,semaphored_job_count=semaphored_job_count+1 "
-                    ).(($dbc->driver eq 'pgsql')
+                    ).(($job_adaptor->dbc->driver eq 'pgsql')
                         ? " ,status = CAST(CASE WHEN status!='BLOCKED' THEN 'LOADING' ELSE 'BLOCKED' END AS analysis_status) "
                         : " ,status =      CASE WHEN status!='BLOCKED' THEN 'LOADING' ELSE 'BLOCKED' END "
                     )." WHERE analysis_id=".$job->analysis_id
@@ -121,14 +128,16 @@ sub store_jobs_and_adjust_counters {
 
             push @output_job_ids, $job->dbID();
 
-        } else {
-            $failed_to_store++;
+        } elsif( $local_job ) {
+            $self->db->get_LogMessageAdaptor->store_hive_message( "JobAdaptor failed to store the local Job( analysis_id=".$job->analysis_id.', '.$job->input_id." ), possibly due to a collision", 0 );
+
+            $failed_to_store_local_jobs++;
         }
     }
 
         # adjust semaphore_count for jobs that failed to be stored (but have been pre-counted during funnel's creation):
-    if($push_new_semaphore and $failed_to_store) {
-        $self->decrease_semaphore_count_for_jobid( $semaphored_job_id, $failed_to_store );
+    if($push_new_semaphore and $failed_to_store_local_jobs) {
+        $self->decrease_semaphore_count_for_jobid( $semaphored_job_id, $failed_to_store_local_jobs );
     }
 
     return \@output_job_ids;
@@ -137,21 +146,29 @@ sub store_jobs_and_adjust_counters {
 
 =head2 fetch_all_by_analysis_id_status
 
-  Arg [1]    : (optional) int $analysis_id
+  Arg [1]    : (optional) listref $list_of_analyses
   Arg [2]    : (optional) string $status
   Arg [3]    : (optional) int $retry_at_least
   Example    : $all_failed_jobs = $adaptor->fetch_all_by_analysis_id_status(undef, 'FAILED');
-               $analysis_done_jobs = $adaptor->fetch_all_by_analysis_id_status($analysis->dbID, 'DONE');
+               $analysis_done_jobs = $adaptor->fetch_all_by_analysis_id_status( $list_of_analyses, 'DONE');
   Description: Returns a list of all jobs filtered by given analysis_id (if specified) and given status (if specified).
   Returntype : reference to list of Bio::EnsEMBL::Hive::AnalysisJob objects
 
 =cut
 
 sub fetch_all_by_analysis_id_status {
-    my ($self, $analysis_id, $status, $retry_count_at_least) = @_;
+    my ($self, $list_of_analyses, $status, $retry_count_at_least) = @_;
 
     my @constraints = ();
-    push @constraints, "analysis_id=$analysis_id"             if ($analysis_id);
+
+    if($list_of_analyses) {
+        if(ref($list_of_analyses) eq 'ARRAY') {
+            push @constraints, "analysis_id IN (".(join(',', map {$_->dbID} @$list_of_analyses)).")";
+        } else {
+            push @constraints, "analysis_id=$list_of_analyses"; # for compatibility with old interface
+        }
+    }
+
     push @constraints, "status='$status'"                     if ($status);
     push @constraints, "retry_count >= $retry_count_at_least" if ($retry_count_at_least);
 
@@ -166,10 +183,10 @@ sub fetch_some_by_analysis_id_limit {
 }
 
 
-sub fetch_all_incomplete_jobs_by_worker_id {
-    my ($self, $worker_id) = @_;
+sub fetch_all_incomplete_jobs_by_role_id {
+    my ($self, $role_id) = @_;
 
-    my $constraint = "status IN ('CLAIMED','PRE_CLEANUP','FETCH_INPUT','RUN','WRITE_OUTPUT','POST_CLEANUP') AND worker_id='$worker_id'";
+    my $constraint = "status IN ('CLAIMED','PRE_CLEANUP','FETCH_INPUT','RUN','WRITE_OUTPUT','POST_CLEANUP') AND role_id='$role_id'";
     return $self->fetch_all($constraint);
 }
 
@@ -224,16 +241,15 @@ sub decrease_semaphore_count_for_jobid {    # used in semaphore annihilation or 
         # NB: BOTH THE ORDER OF UPDATES AND EXACT WORDING IS ESSENTIAL FOR SYNCHRONOUS ATOMIC OPERATION,
         #       otherwise the same command tends to behave differently on MySQL and SQLite (at least)
         #
-    my $sql = "UPDATE job "
-        .( ($self->dbc->driver eq 'pgsql')
-        ? "SET status = CAST(CASE WHEN semaphore_count>$dec THEN 'SEMAPHORED' ELSE 'READY' END AS jw_status), "
-        : "SET status =      CASE WHEN semaphore_count>$dec THEN 'SEMAPHORED' ELSE 'READY' END, "
-        ).qq{
+    my $sql = qq{
+            UPDATE job SET status = CASE WHEN semaphore_count>$dec THEN 'SEMAPHORED' ELSE 'READY' END,
             semaphore_count=semaphore_count-?
         WHERE job_id=? AND status='SEMAPHORED'
     };
     
-    $self->dbc->protected_prepare_execute( $sql, $dec, $jobid );
+    $self->dbc->protected_prepare_execute( [ $sql, $dec, $jobid ],
+        sub { my ($after) = @_; $self->db->get_LogMessageAdaptor->store_hive_message( 'decreasing semaphore_count'.$after, 0 ); }
+    );
 }
 
 sub increase_semaphore_count_for_jobid {    # used in semaphore propagation
@@ -247,11 +263,13 @@ sub increase_semaphore_count_for_jobid {    # used in semaphore propagation
         WHERE job_id=?
     };
     
-    $self->dbc->protected_prepare_execute( $sql, $inc, $jobid );
+    $self->dbc->protected_prepare_execute( [ $sql, $inc, $jobid ],
+        sub { my ($after) = @_; $self->db->get_LogMessageAdaptor->store_hive_message( 'increasing semaphore_count'.$after, 0 ); }
+    );
 }
 
 
-=head2 update_status
+=head2 check_in_job
 
   Arg [1]    : $analysis_id
   Example    :
@@ -262,24 +280,28 @@ sub increase_semaphore_count_for_jobid {    # used in semaphore propagation
 
 =cut
 
-sub update_status {
+sub check_in_job {
     my ($self, $job) = @_;
+
+    my $job_id = $job->dbID;
 
     my $sql = "UPDATE job SET status='".$job->status."' ";
 
     if($job->status eq 'DONE') {
-        $sql .= ",completed=CURRENT_TIMESTAMP";
+        $sql .= ",when_completed=CURRENT_TIMESTAMP";
         $sql .= ",runtime_msec=".$job->runtime_msec;
         $sql .= ",query_count=".$job->query_count;
     } elsif($job->status eq 'PASSED_ON') {
-        $sql .= ", completed=CURRENT_TIMESTAMP";
+        $sql .= ", when_completed=CURRENT_TIMESTAMP";
     } elsif($job->status eq 'READY') {
     }
 
-    $sql .= " WHERE job_id='".$job->dbID."' ";
+    $sql .= " WHERE job_id='$job_id' ";
 
         # This particular query is infamous for collisions and 'deadlock' situations; let's wait and retry:
-    $self->dbc->protected_prepare_execute( $sql );
+    $self->dbc->protected_prepare_execute( [ $sql ],
+        sub { my ($after) = @_; $self->db->get_LogMessageAdaptor->store_job_message( $job_id, "checking the job in".$after, 0 ); }
+    );
 }
 
 
@@ -297,14 +319,16 @@ sub update_status {
 sub store_out_files {
     my ($self, $job) = @_;
 
+    # FIXME: An UPSERT would be better here, but it is only promised in PostgreSQL starting from 9.5, which is not officially out yet.
+
+    my $delete_sql  = 'DELETE from job_file WHERE job_id=' . $job->dbID . ' AND retry='.$job->retry_count;
+    $self->dbc->do( $delete_sql );
+
     if($job->stdout_file or $job->stderr_file) {
-        my $insert_sql = 'REPLACE INTO job_file (job_id, retry, worker_id, stdout_file, stderr_file) VALUES (?,?,?,?,?)';
-        my $sth = $self->dbc()->prepare($insert_sql);
-        $sth->execute($job->dbID(), $job->retry_count(), $job->worker_id(), $job->stdout_file(), $job->stderr_file());
-        $sth->finish();
-    } else {
-        my $sql = 'DELETE from job_file WHERE worker_id='.$job->worker_id.' AND job_id='.$job->dbID;
-        $self->dbc->do($sql);
+        my $insert_sql = 'INSERT INTO job_file (job_id, retry, role_id, stdout_file, stderr_file) VALUES (?,?,?,?,?)';
+        my $insert_sth = $self->dbc->prepare($insert_sql);
+        $insert_sth->execute( $job->dbID, $job->retry_count, $job->role_id, $job->stdout_file, $job->stderr_file );
+        $insert_sth->finish();
     }
 }
 
@@ -312,8 +336,8 @@ sub store_out_files {
 =head2 reset_or_grab_job_by_dbID
 
   Arg [1]    : int $job_id
-  Arg [2]    : int $worker_id (optional)
-  Description: resets a job to to 'READY' (if no $worker_id given) or directly to 'CLAIMED' so it can be run again, and fetches it.
+  Arg [2]    : int $role_id (optional)
+  Description: resets a job to to 'READY' (if no $role_id given) or directly to 'CLAIMED' so it can be run again, and fetches it.
                NB: Will also reset a previously 'SEMAPHORED' job to READY.
                The retry_count will be set to 1 for previously run jobs (partially or wholly) to trigger PRE_CLEANUP for them,
                but will not change retry_count if a job has never *really* started.
@@ -322,21 +346,19 @@ sub store_out_files {
 =cut
 
 sub reset_or_grab_job_by_dbID {
-    my $self        = shift;
-    my $job_id      = shift;
-    my $worker_id   = shift;
+    my ($self, $job_id, $role_id) = @_;
 
-    my $new_status  = ($worker_id?'CLAIMED':'READY');
+    my $new_status  = $role_id ? 'CLAIMED' : 'READY';
 
         # Note: the order of the fields being updated is critical!
     my $sql = qq{
         UPDATE job
            SET retry_count = CASE WHEN (status='READY' OR status='CLAIMED') THEN retry_count ELSE 1 END
              , status=?
-             , worker_id=?
+             , role_id=?
          WHERE job_id=?
     };
-    my @values = ($new_status, $worker_id, $job_id);
+    my @values = ($new_status, $role_id, $job_id);
 
     my $sth = $self->prepare( $sql );
     my $return_code = $sth->execute( @values )
@@ -349,13 +371,14 @@ sub reset_or_grab_job_by_dbID {
 }
 
 
-=head2 grab_jobs_for_worker
+=head2 grab_jobs_for_role
 
-  Arg [1]           : Bio::EnsEMBL::Hive::Worker object $worker
+  Arg [1]           : Bio::EnsEMBL::Hive::Role object $role
+  Arg [2]           : int $how_many_this_role
   Example: 
-    my $jobs  = $job_adaptor->grab_jobs_for_worker( $worker );
+    my $jobs  = $job_adaptor->grab_jobs_for_role( $role, $how_many );
   Description: 
-    For the specified worker, it will search available jobs, 
+    For the specified Role, it will search available jobs, 
     and using the how_many_this_batch parameter, claim/fetch that
     number of jobs, and then return them.
   Returntype : 
@@ -364,12 +387,15 @@ sub reset_or_grab_job_by_dbID {
 
 =cut
 
-sub grab_jobs_for_worker {
-    my ($self, $worker, $how_many_this_batch, $workers_rank) = @_;
+sub grab_jobs_for_role {
+    my ($self, $role, $how_many_this_batch) = @_;
+
+    return [] unless( $how_many_this_batch );
   
-    my $analysis_id = $worker->analysis_id();
-    my $worker_id   = $worker->dbID();
-    my $offset      = $how_many_this_batch*$workers_rank;
+    my $analysis_id     = $role->analysis_id;
+    my $role_id         = $role->dbID;
+    my $role_rank       = $self->db->get_RoleAdaptor->get_role_rank( $role );
+    my $offset          = $how_many_this_batch * $role_rank;
 
     my $prefix_sql = ($self->dbc->driver eq 'mysql') ? qq{
          UPDATE job j
@@ -380,7 +406,7 @@ sub grab_jobs_for_worker {
                                AND status='READY'
     } : qq{
          UPDATE job
-           SET worker_id='$worker_id', status='CLAIMED'
+           SET role_id='$role_id', status='CLAIMED'
          WHERE job_id in (
                             SELECT job_id
                               FROM job
@@ -393,66 +419,88 @@ sub grab_jobs_for_worker {
     my $suffix_sql = ($self->dbc->driver eq 'mysql') ? qq{
                  ) as x
          USING (job_id)
-           SET j.worker_id='$worker_id', j.status='CLAIMED'
+           SET j.role_id='$role_id', j.status='CLAIMED'
          WHERE j.status='READY'
     } : qq{
                  )
            AND status='READY'
     };
 
+    my $claim_count;
+
         # we have to be explicitly numeric here because of '0E0' value returned by DBI if "no rows have been affected":
-    if(  (my $claim_count = $self->dbc->do( $prefix_sql . $virgin_sql . $limit_sql . $offset_sql . $suffix_sql)) == 0 ) {
-        if( ($claim_count = $self->dbc->do( $prefix_sql .               $limit_sql . $offset_sql . $suffix_sql)) == 0 ) {
-             $claim_count = $self->dbc->do( $prefix_sql .               $limit_sql .               $suffix_sql);
+    if(  0 == ($claim_count = $self->dbc->protected_prepare_execute( [ $prefix_sql . $virgin_sql . $limit_sql . $offset_sql . $suffix_sql ],
+                    sub { my ($after) = @_; $self->db->get_LogMessageAdaptor->store_worker_message( $role->worker, "grabbing a virgin batch of offset jobs".$after, 0 ); }
+    ))) {
+        if( 0 == ($claim_count = $self->dbc->protected_prepare_execute( [ $prefix_sql .               $limit_sql . $offset_sql . $suffix_sql ],
+                        sub { my ($after) = @_; $self->db->get_LogMessageAdaptor->store_worker_message( $role->worker, "grabbing a non-virgin batch of offset jobs".$after, 0 ); }
+        ))) {
+             $claim_count = $self->dbc->protected_prepare_execute( [ $prefix_sql .               $limit_sql .               $suffix_sql ],
+                            sub { my ($after) = @_; $self->db->get_LogMessageAdaptor->store_worker_message( $role->worker, "grabbing a non-virgin batch of non-offset jobs".$after, 0 ); }
+             );
         }
     }
 
-    return $self->fetch_all_by_worker_id_AND_status($worker_id, 'CLAIMED') ;
+    $self->db->get_AnalysisStatsAdaptor->increment_a_counter( 'ready_job_count', -$claim_count, $analysis_id );
+
+    return $claim_count ? $self->fetch_all_by_role_id_AND_status($role_id, 'CLAIMED') : [];
 }
 
 
-=head2 release_undone_jobs_from_worker
+sub release_claimed_jobs_from_role {
+    my ($self, $role) = @_;
 
-  Arg [1]    : Bio::EnsEMBL::Hive::Worker object
+        # previous value of role_id is not important, because that Role never had a chance to run the jobs
+    my $num_released_jobs = $self->dbc->protected_prepare_execute( [ "UPDATE job SET status='READY', role_id=NULL WHERE role_id=? AND status='CLAIMED'", $role->dbID ],
+        sub { my ($after) = @_; $self->db->get_LogMessageAdaptor->store_worker_message( $role->worker, "releasing claimed jobs from role".$after, 0 ); }
+    );
+
+    my $analysis_stats_adaptor  = $self->db->get_AnalysisStatsAdaptor;
+    my $analysis_id             = $role->analysis_id;
+
+    $analysis_stats_adaptor->increment_a_counter( 'ready_job_count', $num_released_jobs, $analysis_id );
+
+#    $analysis_stats_adaptor->update_status( $analysis_id, 'LOADING' );
+}
+
+
+=head2 release_undone_jobs_from_role
+
+  Arg [1]    : Bio::EnsEMBL::Hive::Role object
   Arg [2]    : optional message to be recorded in 'job_message' table
   Example    :
-  Description: If a worker has died some of its jobs need to be reset back to 'READY'
+  Description: If a Worker has died some of its jobs need to be reset back to 'READY'
                so they can be rerun.
                Jobs in state CLAIMED as simply reset back to READY.
                If jobs was 'in progress' (PRE_CLEANUP, FETCH_INPUT, RUN, WRITE_OUTPUT, POST_CLEANUP) 
                the retry_count is increased and the status set back to READY.
                If the retry_count >= $max_retry_count (3 by default) the job is set
                to 'FAILED' and not rerun again.
-  Exceptions : $worker must be defined
+  Exceptions : $role must be defined
   Caller     : Bio::EnsEMBL::Hive::Queen
 
 =cut
 
-sub release_undone_jobs_from_worker {
-    my ($self, $worker, $msg) = @_;
+sub release_undone_jobs_from_role {
+    my ($self, $role, $msg) = @_;
 
-    my $max_retry_count = $worker->analysis->max_retry_count();
-    my $worker_id       = $worker->dbID();
-    my $analysis        = $worker->analysis();
+    my $role_id         = $role->dbID;
+    my $analysis        = $role->analysis;
+    my $max_retry_count = $analysis->max_retry_count;
+    my $worker          = $role->worker;
 
         #first just reset the claimed jobs, these don't need a retry_count index increment:
-        # (previous worker_id does not matter, because that worker has never had a chance to run the job)
-    $self->dbc->do( qq{
-        UPDATE job
-           SET status='READY', worker_id=NULL
-         WHERE worker_id='$worker_id'
-           AND status='CLAIMED'
-    } );
+    $self->release_claimed_jobs_from_role( $role );
 
     my $sth = $self->prepare( qq{
         SELECT job_id
           FROM job
-         WHERE worker_id='$worker_id'
+         WHERE role_id='$role_id'
            AND status in ('PRE_CLEANUP','FETCH_INPUT','RUN','WRITE_OUTPUT','POST_CLEANUP')
     } );
     $sth->execute();
 
-    my $cod = $worker->cause_of_death();
+    my $cod = $worker->cause_of_death() || 'UNKNOWN';
     $msg ||= "GarbageCollector: The worker died because of $cod";
 
     my $resource_overusage = ($cod eq 'MEMLIMIT') || ($cod eq 'RUNLIMIT' and $worker->work_done()==0);
@@ -477,6 +525,8 @@ sub release_undone_jobs_from_worker {
         unless($passed_on) {
             $self->release_and_age_job( $job_id, $max_retry_count, not $resource_overusage );
         }
+
+        $role->register_attempt( 0 );
     }
     $sth->finish();
 }
@@ -488,20 +538,23 @@ sub release_and_age_job {
     $runtime_msec = "NULL" unless(defined $runtime_msec);
         # NB: The order of updated fields IS important. Here we first find out the new status and then increment the retry_count:
         #
-        # FIXME: would it be possible to retain worker_id for READY jobs in order to temporarily keep track of the previous (failed) worker?
+        # FIXME: would it be possible to retain role_id for READY jobs in order to temporarily keep track of the previous (failed) worker?
         #
-    $self->dbc->do( 
-        "UPDATE job "
-        .( ($self->dbc->driver eq 'pgsql')
-            ? "SET status = CAST(CASE WHEN $may_retry AND (retry_count<$max_retry_count) THEN 'READY' ELSE 'FAILED' END AS jw_status), "
-            : "SET status =      CASE WHEN $may_retry AND (retry_count<$max_retry_count) THEN 'READY' ELSE 'FAILED' END, "
-         ).qq{
-               retry_count=retry_count+1,
-               runtime_msec=$runtime_msec
-         WHERE job_id=$job_id
-           AND status in ('CLAIMED','PRE_CLEANUP','FETCH_INPUT','RUN','WRITE_OUTPUT','POST_CLEANUP')
+    $self->dbc->do( qq{
+        UPDATE job
+        SET status = CASE WHEN $may_retry AND (retry_count<$max_retry_count) THEN 'READY' ELSE 'FAILED' END,
+            retry_count=retry_count+1,
+            runtime_msec=$runtime_msec
+        WHERE job_id=$job_id
+          AND status in ('CLAIMED','PRE_CLEANUP','FETCH_INPUT','RUN','WRITE_OUTPUT','POST_CLEANUP')
     } );
+
+        # FIXME: move the decision making completely to the API side and so avoid the potential race condition.
+    my $job         = $self->fetch_by_dbID( $job_id );
+
+    $self->db->get_AnalysisStatsAdaptor->increment_a_counter( ($job->status eq 'FAILED') ? 'failed_job_count' : 'ready_job_count', 1, $job->analysis_id );
 }
+
 
 =head2 gc_dataflow
 
@@ -520,12 +573,16 @@ sub gc_dataflow {
     }
 
     my $job = $self->fetch_by_dbID($job_id);
+    $job->analysis( $analysis );
 
-    $job->param_init( 0, $analysis->parameters(), $job->input_id() );    # input_id_templates still supported, however to a limited extent
+    $job->load_parameters();    # input_id_templates still supported, however to a limited extent
 
     $job->dataflow_output_id( $job->input_id() , $branch_name );
 
-    $job->update_status('PASSED_ON');
+    $job->set_and_update_status('PASSED_ON');
+
+        # PASSED_ON jobs are included in done_job_count
+    $self->db->get_AnalysisStatsAdaptor->increment_a_counter( 'done_job_count', 1, $analysis->dbID );
 
     if(my $semaphored_job_id = $job->semaphored_job_id) {
         $self->decrease_semaphore_count_for_jobid( $semaphored_job_id );    # step-unblock the semaphore
@@ -546,31 +603,35 @@ sub gc_dataflow {
 =cut
 
 sub reset_jobs_for_analysis_id {
-    my ($self, $analysis_id, $input_statuses) = @_;
+    my ($self, $list_of_analyses, $input_statuses) = @_;
 
-    my $status_filter = '';
+    my $analyses_filter = ( ref($list_of_analyses) eq 'ARRAY' )
+        ? 'analysis_id IN ('.join(',', map { $_->dbID } @$list_of_analyses).')'
+        : 'analysis_id='.$list_of_analyses;     # compatibility mode (to be deprecated)
 
-    if(ref($input_statuses) eq 'ARRAY') {
-        $status_filter = 'AND status IN ('.join(', ', map { "'$_'" } @$input_statuses).')';
-    } elsif(!$input_statuses) {
-        $status_filter = "AND status='FAILED'"; # temporarily keep it here for compatibility
-    }
+    my $statuses_filter = (ref($input_statuses) eq 'ARRAY')
+        ? 'AND status IN ('.join(', ', map { "'$_'" } @$input_statuses).')'
+        : (!$input_statuses)
+            ? "AND status='FAILED'"             # compatibility mode (to be deprecated)
+            : '';
 
     my $sql = qq{
-            UPDATE job
+           UPDATE job
            SET retry_count = CASE WHEN (status='READY' OR status='CLAIMED') THEN 0 ELSE 1 END,
-        }. ( ($self->dbc->driver eq 'pgsql')
-        ? "status = CAST(CASE WHEN semaphore_count>0 THEN 'SEMAPHORED' ELSE 'READY' END AS jw_status) "
-        : "status =      CASE WHEN semaphore_count>0 THEN 'SEMAPHORED' ELSE 'READY' END "
-        ).qq{
-            WHERE analysis_id=?
-        } . $status_filter;
+               status =      CASE WHEN semaphore_count>0 THEN 'SEMAPHORED' ELSE 'READY' END
+           WHERE } . $analyses_filter .' '. $statuses_filter;
 
     my $sth = $self->prepare($sql);
-    $sth->execute($analysis_id);
+    $sth->execute();
     $sth->finish;
 
-    $self->db->get_AnalysisStatsAdaptor->update_status($analysis_id, 'LOADING');
+    if( ref($list_of_analyses) eq 'ARRAY' ) {
+        foreach my $analysis ( @$list_of_analyses ) {
+            $self->db->get_AnalysisStatsAdaptor->update_status($analysis->dbID, 'LOADING');
+        }
+    } else {
+        $self->db->get_AnalysisStatsAdaptor->update_status($list_of_analyses, 'LOADING');   # compatibility mode (to be deprecated)
+    }
 }
 
 
@@ -581,39 +642,53 @@ sub reset_jobs_for_analysis_id {
 =cut
 
 sub balance_semaphores {
-    my ($self, $filter_analysis_id) = @_;
+    my ($self, $list_of_analyses) = @_;
+
+    my $analysis_filter = $list_of_analyses
+        ? "funnel.analysis_id IN (".join(',', map { $_->dbID } @$list_of_analyses).") AND"
+        : '';
 
     my $find_sql    = qq{
                         SELECT * FROM (
                             SELECT funnel.job_id, funnel.semaphore_count AS was, COALESCE(COUNT(CASE WHEN fan.status!='DONE' AND fan.status!='PASSED_ON' THEN 1 ELSE NULL END),0) AS should
                             FROM job funnel
                             LEFT JOIN job fan ON (funnel.job_id=fan.semaphored_job_id)
-                            WHERE }
-                        .($filter_analysis_id ? "funnel.analysis_id=$filter_analysis_id AND " : '')
-                        .qq{
-                            funnel.status='SEMAPHORED'
+                            WHERE $analysis_filter
+                            funnel.status in ('SEMAPHORED', 'READY')
                             GROUP BY funnel.job_id
                          ) AS internal WHERE was<>should OR should=0
                      };
 
-    my $update_sql  = "UPDATE job SET "
-        ." semaphore_count=? , "
-        .( ($self->dbc->driver eq 'pgsql')
-        ? "status = CAST(CASE WHEN semaphore_count>0 THEN 'SEMAPHORED' ELSE 'READY' END AS jw_status) "
-        : "status =      CASE WHEN semaphore_count>0 THEN 'SEMAPHORED' ELSE 'READY' END "
-        )." WHERE job_id=? AND status='SEMAPHORED'";
+    my $update_sql  = qq{
+        UPDATE job
+        SET semaphore_count=semaphore_count+? ,
+            status         = CASE WHEN semaphore_count>0 THEN 'SEMAPHORED' ELSE 'READY' END
+        WHERE job_id=? AND status IN ('SEMAPHORED', 'READY')
+    };
 
     my $find_sth    = $self->prepare($find_sql);
     my $update_sth  = $self->prepare($update_sql);
 
+    my $rebalanced_jobs_counter = 0;
+
     $find_sth->execute();
     while(my ($job_id, $was, $should) = $find_sth->fetchrow_array()) {
-        warn "Balancing semaphore: job_id=$job_id ($was -> $should)\n";
-        $update_sth->execute($should, $job_id);
-        $self->db->get_LogMessageAdaptor->store_job_message( $job_id, "Re-balancing the semaphore_count: $was -> $should", 1 );
+        my $msg;
+        if(0<$should and $should<$was) {    # we choose not to lower the counter if it's not time to unblock yet
+            $msg = "Semaphore count may need rebalancing, but it is not critical now, so leaving it on automatic: $was -> $should";
+            $self->db->get_LogMessageAdaptor->store_job_message( $job_id, $msg, 0 );
+        } else {
+            $update_sth->execute($should-$was, $job_id);
+            $msg = "Semaphore count needed rebalancing now, so performing: $was -> $should";
+            $self->db->get_LogMessageAdaptor->store_job_message( $job_id, $msg, 1 );
+            $rebalanced_jobs_counter++;
+        }
+        warn "[Job $job_id] $msg\n";    # TODO: integrate the STDERR diagnostic output with LogMessageAdaptor calls in general
     }
     $find_sth->finish;
     $update_sth->finish;
+
+    return $rebalanced_jobs_counter;
 }
 
 

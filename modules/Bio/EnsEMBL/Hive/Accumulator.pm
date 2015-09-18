@@ -11,7 +11,7 @@
 
 =head1 LICENSE
 
-    Copyright [1999-2014] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
+    Copyright [1999-2015] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
 
     Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
     You may obtain a copy of the License at
@@ -32,6 +32,7 @@
 package Bio::EnsEMBL::Hive::Accumulator;
 
 use strict;
+use warnings;
 
 use Bio::EnsEMBL::Hive::Utils ('stringify');
 
@@ -59,15 +60,19 @@ sub signature_template {
 
 
 sub url {
-    my $self    = shift @_;
-    my $ref_dba = shift @_;     # if reference dba is the same as 'our' dba, a shorter url can be generated
+    my ($self, $ref_dba) = @_;  # if reference dba is the same as 'my' dba, a shorter url is generated
 
-    if(my $adaptor = $self->adaptor) {
-        my $dbc_prefix = ($adaptor->db == $ref_dba) ? ':///' : $adaptor->db->dbc->url();
-        return $dbc_prefix .'/accu?'.$self->struct_name(). '=' . $self->signature_template();
-    } else {
-        return;
-    }
+    my $my_dba = $self->adaptor && $self->adaptor->db;
+    return ( ($my_dba and $my_dba ne ($ref_dba//'') ) ? $my_dba->dbc->url : ':///' )
+        . '/accu?' . $self->struct_name . '=' . $self->signature_template;
+}
+
+
+sub display_name {
+    my ($self, $ref_dba) = @_;  # if reference dba is the same as 'my' dba, a shorter display_name is generated
+
+    my $my_dba = $self->adaptor && $self->adaptor->db;
+    return ( ($my_dba and $my_dba ne ($ref_dba//'') ) ? $my_dba->dbc->dbname.'/' : '') . $self->struct_name . $self->signature_template;
 }
 
 

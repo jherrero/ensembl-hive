@@ -16,7 +16,7 @@
 
 =head1 LICENSE
 
-    Copyright [1999-2014] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
+    Copyright [1999-2015] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
 
     Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
     You may obtain a copy of the License at
@@ -42,6 +42,7 @@
 package Bio::EnsEMBL::Hive::DBSQL::AnalysisStatsAdaptor;
 
 use strict;
+use warnings;
 
 use Bio::EnsEMBL::Hive::AnalysisStats;
 
@@ -57,10 +58,10 @@ sub default_input_column_mapping {
     my $self    = shift @_;
     my $driver  = $self->dbc->driver();
     return  {
-        'last_update' => {
-                            'mysql'     => "UNIX_TIMESTAMP()-UNIX_TIMESTAMP(last_update) seconds_since_last_update ",
-                            'sqlite'    => "strftime('%s','now')-strftime('%s',last_update) seconds_since_last_update ",
-                            'pgsql'     => "EXTRACT(EPOCH FROM CURRENT_TIMESTAMP - last_update) seconds_since_last_update ",
+        'when_updated' => {
+                            'mysql'     => "UNIX_TIMESTAMP()-UNIX_TIMESTAMP(when_updated) seconds_since_when_updated ",
+                            'sqlite'    => "strftime('%s','now')-strftime('%s',when_updated) seconds_since_when_updated ",
+                            'pgsql'     => "EXTRACT(EPOCH FROM CURRENT_TIMESTAMP - when_updated) seconds_since_when_updated ",
         }->{$driver},
     };
 }
@@ -68,28 +69,6 @@ sub default_input_column_mapping {
 
 sub object_class {
     return 'Bio::EnsEMBL::Hive::AnalysisStats';
-}
-
-
-sub fetch_all_by_suitability_rc_id_meadow_type {
-    my ($self, $resource_class_id, $meadow_type) = @_;
-
-    my $join_and_filter_sql    = "JOIN analysis_base USING (analysis_id) WHERE "
-                                .( $resource_class_id ? "resource_class_id=$resource_class_id AND " : '')
-                                .( $meadow_type       ? "(meadow_type IS NULL OR meadow_type='$meadow_type') AND " : '');
-
-        # the ones that clearly have work to do:
-    my $primary_sql     = "num_required_workers>0 AND status in ('READY', 'WORKING') "
-                         ."ORDER BY priority DESC, ".( ($self->dbc->driver eq 'mysql') ? 'RAND()' : 'RANDOM()' );
-
-        # the ones that may have work to do after a sync:
-    my $secondary_sql   = "status in ('LOADING', 'BLOCKED', 'ALL_CLAIMED', 'SYNCHING') "
-                         ."ORDER BY last_update";   # FIXME: could mix in a.priority if sync is not too expensive?
-
-    my $primary_results     = $self->fetch_all( $join_and_filter_sql . $primary_sql   );
-    my $secondary_results   = $self->fetch_all( $join_and_filter_sql . $secondary_sql );
-
-    return [ @$primary_results, @$secondary_results ];
 }
 
 
@@ -106,7 +85,10 @@ sub refresh {
 
     my $new_stats = $self->fetch_by_analysis_id( $stats->analysis_id );     # fetch into a separate object
 
+    my $has_hive_pipeline = exists $stats->{'_hive_pipeline'};
+    my $orig_hive_pipeline = $stats->hive_pipeline;
     %$stats = %$new_stats;                                                  # copy the data over
+    $stats->hive_pipeline($orig_hive_pipeline) if $has_hive_pipeline;
 
     return $stats;
 }
@@ -167,12 +149,11 @@ sub update {
       $sql .= ",done_job_count=" . $stats->done_job_count();
       $sql .= ",failed_job_count=" . $stats->failed_job_count();
 
-      $stats->num_running_workers( $self->db->get_Queen->count_running_workers( $stats->analysis_id() ) );
+      $stats->num_running_workers( $self->db->get_RoleAdaptor->count_active_roles( $stats->analysis_id() ) );
       $sql .= ",num_running_workers=" . $stats->num_running_workers();
   }
 
-  $sql .= ",num_required_workers=" . $stats->num_required_workers();
-  $sql .= ",last_update=CURRENT_TIMESTAMP";
+  $sql .= ",when_updated=CURRENT_TIMESTAMP";
   $sql .= ",sync_lock='0'";
   $sql .= " WHERE analysis_id='".$stats->analysis_id."' ";
 
@@ -182,15 +163,14 @@ sub update {
   $sth = $self->prepare("INSERT INTO analysis_stats_monitor SELECT CURRENT_TIMESTAMP, analysis_stats.* from analysis_stats WHERE analysis_id = ".$stats->analysis_id);
   $sth->execute();
   $sth->finish;
-  $stats->seconds_since_last_update(0); #not exact but good enough :)
+  $stats->seconds_since_when_updated(0); #not exact but good enough :)
 }
 
 
 sub update_status {
   my ($self, $analysis_id, $status) = @_;
 
-  my $sql = "UPDATE analysis_stats SET status='$status' ";
-  $sql .= " WHERE analysis_id='$analysis_id' ";
+  my $sql = "UPDATE analysis_stats SET status='$status' WHERE analysis_id='$analysis_id' ";
 
   my $sth = $self->prepare($sql);
   $sth->execute();
@@ -235,58 +215,25 @@ sub interval_update_work_done {
         avg_input_msec_per_job = (((done_job_count*avg_input_msec_per_job)/$weight_factor + $fetching_msec) / (done_job_count/$weight_factor + $job_count)), 
         avg_run_msec_per_job = (((done_job_count*avg_run_msec_per_job)/$weight_factor + $running_msec) / (done_job_count/$weight_factor + $job_count)), 
         avg_output_msec_per_job = (((done_job_count*avg_output_msec_per_job)/$weight_factor + $writing_msec) / (done_job_count/$weight_factor + $job_count)), 
-        ready_job_count = ready_job_count - $job_count, 
         done_job_count = done_job_count + $job_count 
     WHERE analysis_id= $analysis_id
   };
 
-  $self->dbc->do($sql);
+  $self->dbc->do( $sql );
 }
 
 
-sub increase_running_workers {
-  my $self = shift;
-  my $analysis_id = shift;
+sub increment_a_counter {
+    my ($self, $counter, $increment, $analysis_id) = @_;
 
-  my $sql = "UPDATE analysis_stats SET num_running_workers = num_running_workers + 1 ".
-      " WHERE analysis_id='$analysis_id'";
-
-  $self->dbc->do($sql);
+    unless( $self->db->hive_use_triggers() ) {
+        if($increment) {    # can either be positive or negative
+## ToDo: does it make sense to update the timestamp as well, to signal to the sync-allowed workers that they should wait?
+#            $self->dbc->do( "UPDATE analysis_stats SET $counter = $counter + ($increment), when_updated=CURRENT_TIMESTAMP WHERE sync_lock=0 AND analysis_id='$analysis_id'" );
+            $self->dbc->do( "UPDATE analysis_stats SET $counter = $counter + ($increment) WHERE sync_lock=0 AND analysis_id='$analysis_id'" );
+        }
+    }
 }
-
-
-sub decrease_running_workers {
-  my $self = shift;
-  my $analysis_id = shift;
-
-  my $sql = "UPDATE analysis_stats SET num_running_workers = num_running_workers - 1 ".
-      " WHERE analysis_id='$analysis_id'";
-
-  $self->dbc->do($sql);
-}
-
-
-sub decrease_required_workers {
-  my $self = shift;
-  my $analysis_id = shift;
-
-  my $sql = "UPDATE analysis_stats SET num_required_workers=num_required_workers-1 ".
-            "WHERE analysis_id='$analysis_id' ";
-
-  $self->dbc->do($sql);
-}
-
-
-sub increase_required_workers {
-  my $self = shift;
-  my $analysis_id = shift;
-
-  my $sql = "UPDATE analysis_stats SET num_required_workers=num_required_workers+1 ".
-            "WHERE analysis_id='$analysis_id' ";
-
-  $self->dbc->do($sql);
-}
-
 
 1;
 

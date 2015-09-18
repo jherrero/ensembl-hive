@@ -12,14 +12,15 @@
     AnalysisCtrl rules.
   
     Instances of these Processes are created by the system as work is done.
-    The newly created Process will have preset $self->db, $self->dbc, 
-    $self->input_id, $self->analysis and several other variables. 
+    The newly created Process will have preset $self->db, $self->dbc, $self->input_id
+    and several other variables. 
     From this input and configuration data, each Process can then proceed to 
     do something.  The flow of execution within a Process is:
         pre_cleanup() if($retry_count>0);   # clean up databases/filesystem before subsequent attempts
         fetch_input();                      # fetch the data from databases/filesystems
         run();                              # perform the main computation 
         write_output();                     # record the results in databases/filesystems
+        post_healthcheck();                 # check if we got the expected result (optional)
         post_cleanup();                     # destroy all non-trivial data structures after the job is done
     The developer can implement their own versions of
     pre_cleanup, fetch_input, run, write_output, and post_cleanup to do what they need.  
@@ -71,7 +72,7 @@
 
 =head1 LICENSE
 
-    Copyright [1999-2014] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
+    Copyright [1999-2015] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
 
     Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
     You may obtain a copy of the License at
@@ -99,7 +100,6 @@ package Bio::EnsEMBL::Hive::Process;
 use strict;
 use warnings;
 
-use Bio::EnsEMBL::Hive::DBSQL::DBConnection;
 use Bio::EnsEMBL::Hive::Utils ('stringify', 'go_figure_dbc');
 use Bio::EnsEMBL::Hive::Utils::Stopwatch;
 
@@ -114,7 +114,7 @@ sub new {
 
 
 sub life_cycle {
-    my ($self, $worker) = @_;
+    my ($self) = @_;
 
     my $job = $self->input_job();
     my $partial_stopwatch = Bio::EnsEMBL::Hive::Utils::Stopwatch->new();
@@ -144,44 +144,65 @@ sub life_cycle {
             $partial_stopwatch->restart();
             $self->write_output;
             $job_partial_timing{'WRITE_OUTPUT'} = $partial_stopwatch->get_elapsed();
+
+            if( $self->can('post_healthcheck') ) {
+                $self->enter_status('POST_HEALTHCHECK');
+                $self->post_healthcheck;
+            }
         } else {
-            print STDERR "\n!!! *no* WRITE_OUTPUT requested, so there will be no AUTOFLOW\n" if($self->debug); 
+            $self->say_with_header( ": *no* WRITE_OUTPUT requested, so there will be no AUTOFLOW" );
         }
     };
 
-    my $error_msg = $@;
+    if(my $life_cycle_msg = $@) {
+        $job->died_somewhere( $job->incomplete );  # it will be OR'd inside
+        $self->warning( $life_cycle_msg, $job->incomplete );
+    }
 
     if( $self->can('post_cleanup') ) {   # may be run to clean up memory even after partially failed attempts
         eval {
+            $job->incomplete(1);    # it could have been reset by a previous call to complete_early
             $self->enter_status('POST_CLEANUP');
             $self->post_cleanup;
         };
-        if($@) {
-            $error_msg .= $@;
-            $job->incomplete(1);
+        if(my $post_cleanup_msg = $@) {
+            $job->died_somewhere( $job->incomplete );  # it will be OR'd inside
+            $self->warning( $post_cleanup_msg, $job->incomplete );
         }
     }
 
-    if( $error_msg ) {
-        if( $job->incomplete ) {    # retransmit the death message if it was not a suicide, continue otherwise
-            die $error_msg;
+    unless( $job->died_somewhere ) {
+
+        if( $self->execute_writes and $job->autoflow ) {    # AUTOFLOW doesn't have its own status so will have whatever previous state of the job
+            $self->say_with_header( ': AUTOFLOW input->output' );
+            $job->dataflow_output_id();
+        }
+
+        my @zombie_funnel_dataflow_rule_ids = keys %{$job->fan_cache};
+        if( scalar(@zombie_funnel_dataflow_rule_ids) ) {
+            $job->transient_error(0);
+            die "There are cached semaphored fans for which a funnel job (dataflow_rule_id(s) ".join(',',@zombie_funnel_dataflow_rule_ids).") has never been dataflown";
+        }
+
+        $job->incomplete(0);
+
+        return \%job_partial_timing;
+    }
+}
+
+
+sub say_with_header {
+    my ($self, $msg, $important) = @_;
+
+    $important //= $self->debug();
+
+    if($important) {
+        if(my $worker = $self->worker) {
+            $worker->worker_say( $msg );
         } else {
-            $self->warning( $error_msg );
+            print STDERR "StandaloneJob $msg\n";
         }
     }
-
-    if( $self->execute_writes and $job->autoflow ) {    # AUTOFLOW doesn't have its own status so will have whatever previous state of the job
-        print STDERR "\njob ".$job->dbID." : AUTOFLOW input->output\n" if($self->debug);
-        $job->dataflow_output_id();
-    }
-
-    my @zombie_funnel_dataflow_rule_ids = keys %{$job->fan_cache};
-    if( scalar(@zombie_funnel_dataflow_rule_ids) ) {
-        $job->transient_error(0);
-        die "There are cached semaphored fans for which a funnel job (dataflow_rule_id(s) ".join(',',@zombie_funnel_dataflow_rule_ids).") has never been dataflown";
-    }
-
-    return \%job_partial_timing;
 }
 
 
@@ -190,14 +211,28 @@ sub enter_status {
 
     my $job = $self->input_job();
 
-    $job->update_status( $status );
-
-    my $status_msg  = 'Job '.$job->dbID.' : '.$status;
+    $job->set_and_update_status( $status );
 
     if(my $worker = $self->worker) {
-        $worker->enter_status( $status, $status_msg );
-    } elsif($self->debug) {
-        print STDERR "Standalone$status_msg\n";
+        $worker->set_and_update_status( 'JOB_LIFECYCLE' );  # to ensure when_checked_in TIMESTAMP is updated
+    }
+
+    $self->say_with_header( '-> '.$status );
+}
+
+
+sub warning {
+    my ($self, $msg, $is_error) = @_;
+
+    $is_error //= 0;
+    chomp $msg;
+
+    $self->say_with_header( ($is_error ? 'Fatal' : 'Warning')." : $msg", 1 );
+
+    my $job = $self->input_job;
+
+    if(my $job_adaptor = $job->adaptor) {
+        $job_adaptor->db->get_LogMessageAdaptor()->store_job_message($job->dbID, $msg, $is_error);
     }
 }
 
@@ -208,18 +243,6 @@ sub enter_status {
 # in order to give this process function
 #
 ##########################################
-
-=head2 strict_hash_format
-
-    Title   :  strict_hash_format
-    Function:  if a subclass wants more flexibility in parsing job.input_id and analysis.parameters,
-               it should redefine this method to return 0
-
-=cut
-
-sub strict_hash_format {
-    return 1;
-}
 
 
 =head2 param_defaults
@@ -234,12 +257,9 @@ sub param_defaults {
 }
 
 
-=head2 pre_cleanup
-
-    Title   :  pre_cleanup
-    Function:  sublcass can implement functions related to cleaning up the database/filesystem after the previous unsuccessful run.
-               
-=cut
+#
+## Function: sublcass can implement functions related to cleaning up the database/filesystem after the previous unsuccessful run.
+#
 
 # sub pre_cleanup {
 #    my $self = shift;
@@ -252,10 +272,9 @@ sub param_defaults {
 
     Title   :  fetch_input
     Function:  sublcass can implement functions related to data fetching.
-               Typical acivities would be to parse $self->input_id and read
-               configuration information from $self->analysis.  Subclasses
-               may also want to fetch data from databases or from files 
-               within this function.
+               Typical acivities would be to parse $self->input_id .
+               Subclasses may also want to fetch data from databases
+               or from files within this function.
 
 =cut
 
@@ -299,13 +318,10 @@ sub write_output {
 }
 
 
-=head2 post_cleanup
-
-    Title   :  post_cleanup
-    Function:  sublcass can implement functions related to cleaning up after running one job
-               (destroying non-trivial data structures in memory).
-               
-=cut
+#
+## Function:  sublcass can implement functions related to cleaning up after running one job
+#               (destroying non-trivial data structures in memory).
+#
 
 #sub post_cleanup {
 #    my $self = shift;
@@ -414,27 +430,6 @@ sub data_dbc {
 }
 
 
-=head2 analysis
-
-    Title   :  analysis
-    Usage   :  $self->analysis;
-    Function:  Returns the Analysis object associated with this
-               instance of the Process.
-    Returns :  Bio::EnsEMBL::Hive::Analysis object
-
-=cut
-
-sub analysis {
-  my ($self, $analysis) = @_;
-
-  if($analysis) {
-    throw("Not a Bio::EnsEMBL::Hive::Analysis object")
-      unless ($analysis->isa("Bio::EnsEMBL::Hive::Analysis"));
-    $self->{'_analysis'} = $analysis;
-  }
-  return $self->{'_analysis'};
-}
-
 =head2 input_job
 
     Title   :  input_job
@@ -445,13 +440,14 @@ sub analysis {
 =cut
 
 sub input_job {
-  my( $self, $job ) = @_;
-  if($job) {
-    throw("Not a Bio::EnsEMBL::Hive::AnalysisJob object")
-        unless ($job->isa("Bio::EnsEMBL::Hive::AnalysisJob"));
-    $self->{'_input_job'} = $job;
-  }
-  return $self->{'_input_job'};
+    my $self = shift @_;
+
+    if(@_) {
+        if(my $job = $self->{'_input_job'} = shift) {
+            throw("Not a Bio::EnsEMBL::Hive::AnalysisJob object") unless ($job->isa("Bio::EnsEMBL::Hive::AnalysisJob"));
+        }
+    }
+    return $self->{'_input_job'};
 }
 
 
@@ -493,15 +489,10 @@ sub param_substitute {
     return $self->input_job->param_substitute(@_);
 }
 
-sub warning {
-    my $self = shift @_;
-
-    return $self->input_job->warning(@_);
-}
-
 sub dataflow_output_id {
     my $self = shift @_;
 
+    $self->say_with_header(sprintf("Dataflow on branch #%d of %s", $_[1] || 1, stringify($_[0])));
     return $self->input_job->dataflow_output_id(@_);
 }
 
@@ -510,6 +501,14 @@ sub throw {
     my $msg = pop @_;
 
     Bio::EnsEMBL::Hive::Utils::throw( $msg );   # this module doesn't import 'throw' to avoid namespace clash
+}
+
+
+sub complete_early {
+    my ($self, $msg) = @_;
+
+    $self->input_job->incomplete(0);
+    die $msg;
 }
 
 

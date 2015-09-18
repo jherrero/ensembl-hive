@@ -10,7 +10,7 @@
 
 =head1 LICENSE
 
-    Copyright [1999-2014] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
+    Copyright [1999-2015] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
 
     Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
     You may obtain a copy of the License at
@@ -40,9 +40,9 @@ sub parse {
     my $url = shift @_ or return;
 
     if( my ($dbconn_part, $driver, $user, $pass, $host, $port, $dbname, $table_name, $tparam_name, $tparam_value, $conn_param_string) =
-        $url =~ m{^((\w*)://(?:(\w+)(?:\:([^/\@]*))?\@)?(?:([\w\-\.]+)(?:\:(\d*))?)?/([\w\-]*))(?:/(\w+)(?:\?(\w+)=([\w\[\]\{\}]+))?)?((?:;(\w+)=(\w+))*)$} ) {
+        $url =~ m{^((\w*)://(?:(\w+)(?:\:([^/\@]*))?\@)?(?:([\w\-\.]+)(?:\:(\d*))?)?/([\w\-]*))(?:/(\w+)(?:\?(\w+)=([\w\[\]\{\}]*))?)?((?:;(\w+)=(\w+))*)$} ) {
 
-        my %conn_params = split(/[;=]/, 'type=hive;discon=0'.$conn_param_string );
+        my %conn_params = split(/[;=]/, 'type=hive;disconnect_when_inactive=0'.$conn_param_string );
 
         my $parsed_url = {
             'dbconn_part'   => $dbconn_part,
@@ -56,6 +56,22 @@ sub parse {
             'tparam_name'   => $tparam_name,
             'tparam_value'  => $tparam_value,
             'conn_params'   => \%conn_params,
+        };
+
+        $port ||= { 'mysql' => 3306, 'pgsql' => 5432, 'sqlite' => '' }->{$driver} // '';
+        $host = '127.0.0.1' if(($host//'') eq 'localhost');
+        my $unambig_url = $driver .'://'. ($user ? $user.'@' : '') . ($host//'') . ( $port ? ':'.$port : '') .'/'. ($dbname//'');
+        $parsed_url->{'unambig_url'} = $unambig_url;
+
+        return $parsed_url;
+
+    } elsif( $url=~/^\w+$/ ) {
+
+        my $parsed_url = {
+            'unambig_url'   => ':///',
+            'table_name'    => 'analysis',
+            'tparam_name'   => 'logic_name',
+            'tparam_value'  => $url,
         };
 
         return $parsed_url;

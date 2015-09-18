@@ -16,12 +16,14 @@ use Getopt::Long;
 use File::Path 'make_path';
 use Bio::EnsEMBL::Hive::Utils ('script_usage', 'destringify', 'report_versions');
 use Bio::EnsEMBL::Hive::Utils::Config;
-use Bio::EnsEMBL::Hive::DBSQL::DBAdaptor;
+use Bio::EnsEMBL::Hive::HivePipeline;
 use Bio::EnsEMBL::Hive::Queen;
 use Bio::EnsEMBL::Hive::Valley;
 use Bio::EnsEMBL::Hive::Scheduler;
 
+
 main();
+
 
 sub main {
     $| = 1;
@@ -48,14 +50,17 @@ sub main {
     my $force                       = undef;
     my $keep_alive                  = 0; # ==1 means run even when there is nothing to do
     my $check_for_dead              = 0;
+    my $bury_unkwn_workers          = 0;
     my $all_dead                    = 0;
     my $balance_semaphores          = 0;
     my $job_id_for_output           = 0;
     my $show_worker_stats           = 0;
     my $kill_worker_id              = 0;
     my $reset_job_id                = 0;
-    my $reset_all_jobs_for_analysis = 0;
-    my $reset_failed_jobs_for_analysis = 0;
+    my $reset_all_jobs_for_analysis = 0;        # DEPRECATED
+    my $reset_failed_jobs_for_analysis = 0;     # DEPRECATED
+    my $reset_all_jobs              = 0;
+    my $reset_failed_jobs           = 0;
 
     $self->{'url'}                  = undef;
     $self->{'reg_conf'}             = undef;
@@ -63,12 +68,12 @@ sub main {
     $self->{'reg_alias'}            = undef;
     $self->{'nosqlvc'}              = undef;
 
+    $self->{'config_files'}         = [];
+
     $self->{'sleep_minutes'}        = 1;
     $self->{'retry_throwing_jobs'}  = undef;
     $self->{'can_respecialize'}     = undef;
     $self->{'hive_log_dir'}         = undef;
-    $self->{'submit_stdout_file'}   = undef;
-    $self->{'submit_stderr_file'}   = undef;
     $self->{'submit_log_dir'}       = undef;
 
     GetOptions(
@@ -78,6 +83,9 @@ sub main {
                'reg_type=s'         => \$self->{'reg_type'},
                'reg_alias|regname=s'=> \$self->{'reg_alias'},
                'nosqlvc=i'          => \$self->{'nosqlvc'},     # can't use the binary "!" as it is a propagated option
+
+                    # json config files
+               'config_file=s@'     => $self->{'config_files'},
 
                     # loop control
                'run'                => \$run,
@@ -99,12 +107,11 @@ sub main {
                'job_limit=i'            => \$self->{'job_limit'},
                'life_span|lifespan=i'   => \$self->{'life_span'},
                'logic_name=s'           => \$self->{'logic_name'},
+               'analyses_pattern=s'     => \$self->{'analyses_pattern'},
                'hive_log_dir|hive_output_dir=s'      => \$self->{'hive_log_dir'},
                'retry_throwing_jobs=i'  => \$self->{'retry_throwing_jobs'},
                'can_respecialize=i'     => \$self->{'can_respecialize'},
                'debug=i'                => \$self->{'debug'},
-               'submit_stdout_file=s'   => \$self->{'submit_stdout_file'},
-               'submit_stderr_file=s'   => \$self->{'submit_stderr_file'},
                'submit_log_dir=s'       => \$self->{'submit_log_dir'},
 
                     # other commands/options
@@ -112,6 +119,7 @@ sub main {
                'v|versions!'       => \$report_versions,
                'sync!'             => \$sync,
                'dead!'             => \$check_for_dead,
+               'unkwn!'            => \$bury_unkwn_workers,
                'killworker=i'      => \$kill_worker_id,
                'alldead!'          => \$all_dead,
                'balance_semaphores'=> \$balance_semaphores,
@@ -119,8 +127,10 @@ sub main {
                'worker_stats'      => \$show_worker_stats,
                'failed_jobs'       => \$show_failed_jobs,
                'reset_job_id=i'    => \$reset_job_id,
-               'reset_failed|reset_failed_jobs_for_analysis=s' => \$reset_failed_jobs_for_analysis,
-               'reset_all|reset_all_jobs_for_analysis=s' => \$reset_all_jobs_for_analysis,
+               'reset_failed_jobs_for_analysis=s' => \$reset_failed_jobs_for_analysis,
+               'reset_all_jobs_for_analysis=s' => \$reset_all_jobs_for_analysis,
+               'reset_failed_jobs' => \$reset_failed_jobs,
+               'reset_all_jobs'    => \$reset_all_jobs,
                'job_output=i'      => \$job_id_for_output,
     );
 
@@ -131,7 +141,7 @@ sub main {
         exit(0);
     }
 
-    my $config = Bio::EnsEMBL::Hive::Utils::Config->new();      # will probably add a config_file option later
+    my $config = Bio::EnsEMBL::Hive::Utils::Config->new(@{$self->{'config_files'}});
 
     if($run or $run_job_id) {
         $max_loops = 1;
@@ -142,23 +152,27 @@ sub main {
     }
 
     if($self->{'url'} or $self->{'reg_alias'}) {
-        $self->{'dba'} = Bio::EnsEMBL::Hive::DBSQL::DBAdaptor->new(
+
+        $self->{'pipeline'} = Bio::EnsEMBL::Hive::HivePipeline->new(
             -url                            => $self->{'url'},
             -reg_conf                       => $self->{'reg_conf'},
             -reg_type                       => $self->{'reg_type'},
             -reg_alias                      => $self->{'reg_alias'},
             -no_sql_schema_version_check    => $self->{'nosqlvc'},
         );
+
+        $self->{'dba'} = $self->{'pipeline'}->hive_dba();
+
     } else {
         print "\nERROR : Connection parameters (url or reg_conf+reg_alias) need to be specified\n\n";
         script_usage(1);
     }
 
-    $self->{'safe_url'} = $self->{'dba'}->dbc->url('WORKER_PASSWORD');
+    if( $self->{'url'} ) {    # protect the URL that we pass to Workers by hiding the password in %ENV:
+        $self->{'url'} = "'". $self->{'dba'}->dbc->url('EHIVE_PASS') ."'";
+    }
 
-    my $queen = $self->{'dba'}->get_Queen;
-
-    my $pipeline_name = $self->{'dba'}->get_MetaAdaptor->get_value_by_key( 'hive_pipeline_name' );
+    my $pipeline_name = $self->{'pipeline'}->hive_pipeline_name;
 
     if($pipeline_name) {
         warn "Pipeline name: $pipeline_name\n";
@@ -197,6 +211,8 @@ sub main {
     $default_meadow->config_set('TotalRunningWorkersMax', $total_running_workers_max) if(defined $total_running_workers_max);
     $default_meadow->config_set('SubmissionOptions', $submission_options) if(defined $submission_options);
 
+    my $queen = $self->{'dba'}->get_Queen;
+
     if($reset_job_id) { $queen->reset_job_by_dbID_and_sync($reset_job_id); }
 
     if($job_id_for_output) {
@@ -205,17 +221,16 @@ sub main {
         print $job->toString. "\n";
     }
 
-    if(my $reset_logic_name = $reset_all_jobs_for_analysis || $reset_failed_jobs_for_analysis) {
-
-        my $reset_analysis = $self->{'dba'}->get_AnalysisAdaptor->fetch_by_logic_name($reset_logic_name)
-              || die( "Cannot AnalysisAdaptor->fetch_by_logic_name($reset_logic_name)"); 
-
-        $self->{'dba'}->get_AnalysisJobAdaptor->reset_jobs_for_analysis_id($reset_analysis->dbID, $reset_all_jobs_for_analysis); 
-        $self->{'dba'}->get_Queen->synchronize_AnalysisStats($reset_analysis->stats);
+    if($reset_all_jobs_for_analysis) {
+        die "Deprecated option -reset_all_jobs_for_analysis. Please use -reset_all_jobs in combination with -analyses_pattern <pattern>";
+    }
+    if($reset_failed_jobs_for_analysis) {
+        die "Deprecated option -reset_failed_jobs_for_analysis. Please use -reset_failed_jobs in combination with -analyses_pattern <pattern>";
     }
 
     if ($kill_worker_id) {
-        my $kill_worker = $queen->fetch_by_dbID($kill_worker_id);
+        my $kill_worker = $queen->fetch_by_dbID($kill_worker_id)
+            or die "Could not fetch worker with dbID='$kill_worker_id' to kill";
 
         unless( $kill_worker->cause_of_death() ) {
             if( my $meadow = $valley->find_available_meadow_responsible_for_worker( $kill_worker ) ) {
@@ -240,40 +255,68 @@ sub main {
         }
     }
 
-    my $analysis = $run_job_id
-        ? $self->{'dba'}->get_AnalysisAdaptor->fetch_by_dbID( $self->{'dba'}->get_AnalysisJobAdaptor->fetch_by_dbID( $run_job_id )->analysis_id )
-        : $self->{'dba'}->get_AnalysisAdaptor->fetch_by_logic_name($self->{'logic_name'});
+    if( $self->{'logic_name'} ) {   # FIXME: for now, logic_name will override analysis_pattern quietly
+        warn "-logic_name is now deprecated, please use -analyses_pattern that extends the functionality of -logic_name .\n";
+        $self->{'analyses_pattern'} = $self->{'logic_name'};
+    }
+
+    my $run_job;
+    if($run_job_id) {
+        $run_job = $self->{'dba'}->get_AnalysisJobAdaptor->fetch_by_dbID( $run_job_id )
+            or die "Could not fetch Job with dbID=$run_job_id.\n";
+    }
+
+    my $list_of_analyses = $run_job
+        ? [ $run_job->analysis ]
+        : $self->{'pipeline'}->collection_of('Analysis')->find_all_by_pattern( $self->{'analyses_pattern'} );
+
+    if( $self->{'analyses_pattern'} ) {
+        if( @$list_of_analyses ) {
+            print "Beekeeper : the following Analyses matched your -analysis_pattern '".$self->{'analyses_pattern'}."' : "
+                .join(', ', map { $_->logic_name.'('.$_->dbID.')' } @$list_of_analyses)."\n\n";
+        } else {
+            die "Beekeeper : the -analyses_pattern '".$self->{'analyses_pattern'}."' did not match any Analyses.\n"
+        }
+    }
+
+    if($reset_all_jobs || $reset_failed_jobs) {
+        if ($reset_all_jobs and not $self->{'analyses_pattern'}) {
+            die "Beekeeper : do you really want to reset *all* the jobs ? If yes, add \"-analyses_pattern '%'\" to the command line\n";
+        }
+        $self->{'dba'}->get_AnalysisJobAdaptor->reset_jobs_for_analysis_id( $list_of_analyses, $reset_all_jobs ); 
+        $queen->synchronize_hive( $list_of_analyses );
+    }
 
     if($all_dead)           { $queen->register_all_workers_dead(); }
     if($check_for_dead)     { $queen->check_for_dead_workers($valley, 1); }
-    if($balance_semaphores) { $self->{'dba'}->get_AnalysisJobAdaptor->balance_semaphores( $analysis && $analysis->dbID ); }
+    if($bury_unkwn_workers) { $queen->check_for_dead_workers($valley, 1, 1); }
+    if($balance_semaphores) { $self->{'dba'}->get_AnalysisJobAdaptor->balance_semaphores( $list_of_analyses ); }
 
     if ($max_loops) { # positive $max_loop means limited, negative means unlimited
 
-        run_autonomously($self, $max_loops, $keep_alive, $queen, $valley, $analysis, $run_job_id, $force);
+        run_autonomously($self, $self->{'pipeline'}, $max_loops, $keep_alive, $valley, $list_of_analyses, $self->{'analyses_pattern'}, $run_job_id, $force);
 
     } else {
             # the output of several methods will look differently depending on $analysis being [un]defined
 
         if($sync) {
-            $queen->synchronize_hive($analysis);
+            $queen->synchronize_hive( $list_of_analyses );
         }
-        $queen->print_analysis_status($analysis) unless($self->{'no_analysis_stats'});
+        print $queen->print_status_and_return_reasons_to_exit( $list_of_analyses, !$self->{'no_analysis_stats'} );
 
         if($show_worker_stats) {
             print "\n===== List of live Workers according to the Queen: ======\n";
             foreach my $worker (@{ $queen->fetch_overdue_workers(0) }) {
-                print $worker->toString()."\n";
+                print $worker->toString(1)."\n";
             }
         }
-        $queen->print_running_worker_counts;
+        $self->{'dba'}->get_RoleAdaptor->print_active_role_counts;
 
-        Bio::EnsEMBL::Hive::Scheduler::schedule_workers_resync_if_necessary($queen, $valley, $analysis);   # show what would be submitted, but do not actually submit
-        $queen->get_remaining_jobs_show_hive_progress();
+        Bio::EnsEMBL::Hive::Scheduler::schedule_workers_resync_if_necessary($queen, $valley, $list_of_analyses);   # show what would be submitted, but do not actually submit
 
         if($show_failed_jobs) {
             print("===== failed jobs\n");
-            my $failed_job_list = $self->{'dba'}->get_AnalysisJobAdaptor->fetch_all_by_analysis_id_status($analysis && $analysis->dbID, 'FAILED');
+            my $failed_job_list = $self->{'dba'}->get_AnalysisJobAdaptor->fetch_all_by_analysis_id_status( $self->{'logic_name'} and $list_of_analyses , 'FAILED');
 
             foreach my $job (@{$failed_job_list}) {
                 print $job->toString. "\n";
@@ -292,7 +335,7 @@ sub main {
 
 
 sub generate_worker_cmd {
-    my ($self, $run_analysis, $run_job_id, $force) = @_;
+    my ($self, $analyses_pattern, $run_job_id, $force) = @_;
 
     my $worker_cmd = $ENV{'EHIVE_ROOT_DIR'}.'/scripts/runWorker.pl';
 
@@ -310,8 +353,8 @@ sub generate_worker_cmd {
         # special task:
     if ($run_job_id) {
         $worker_cmd .= " -job_id $run_job_id";
-    } elsif ($run_analysis) {
-        $worker_cmd .= " -logic_name ".$run_analysis->logic_name;
+    } elsif ($analyses_pattern) {
+        $worker_cmd .= " -analyses_pattern '".$analyses_pattern."'";
     }
 
     if (defined($force)) {
@@ -321,39 +364,38 @@ sub generate_worker_cmd {
     return $worker_cmd;
 }
 
+
 sub run_autonomously {
-    my ($self, $max_loops, $keep_alive, $queen, $valley, $run_analysis, $run_job_id, $force) = @_;
+    my ($self, $pipeline, $max_loops, $keep_alive, $valley, $list_of_analyses, $analyses_pattern, $run_job_id, $force) = @_;
 
-    my $resourceless_worker_cmd = generate_worker_cmd($self, $run_analysis, $run_job_id, $force);
-    my $special_task            = $run_analysis || $run_job_id;
+    my $hive_dba = $pipeline->hive_dba;
+    my $queen    = $hive_dba->get_Queen;
 
-    my $rc_id2name  = $self->{'dba'}->get_ResourceClassAdaptor->fetch_HASHED_FROM_resource_class_id_TO_name();
-    my %meadow_type_rc_name2resource_param_list = ();
-    foreach my $rd (@{ $self->{'dba'}->get_ResourceDescriptionAdaptor->fetch_all() }) {
-        $meadow_type_rc_name2resource_param_list{ $rd->meadow_type() }{ $rc_id2name->{$rd->resource_class_id} } = [ $rd->submission_cmd_args, $rd->worker_cmd_args ];
-    }
+    my $resourceless_worker_cmd = generate_worker_cmd($self, $analyses_pattern, $run_job_id, $force);
 
     my $beekeeper_pid = $$;
 
     my $iteration=0;
-    my $num_of_remaining_jobs=0;
-    my $failed_analyses=0;
-    do {
-        if($iteration++) {
-            $self->{'dba'}->dbc->disconnect_if_idle;
-            printf("sleep %.2f minutes. Next loop at %s\n", $self->{'sleep_minutes'}, scalar localtime(time+$self->{'sleep_minutes'}*60));
-            sleep($self->{'sleep_minutes'}*60);  
-        }
+    my $reasons_to_exit;
 
-        print("\n======= beekeeper loop ** $iteration **==========\n");
+    BKLOOP: while( ($iteration++ != $max_loops) or $keep_alive ) {  # NB: the order of conditions is important!
+
+        print("\nBeekeeper : loop #$iteration ======================================================\n");
 
         $queen->check_for_dead_workers($valley, 0);
 
-        $queen->print_analysis_status unless($self->{'no_analysis_stats'});
-        $queen->print_running_worker_counts;
+        if( $reasons_to_exit = $queen->print_status_and_return_reasons_to_exit( $list_of_analyses, !$self->{'no_analysis_stats'} )) {
+            if($keep_alive) {
+                print "Beekeeper : detected exit condition, but staying alive because of -keep_alive : ".$reasons_to_exit;
+            } else {
+                last BKLOOP;
+            }
+        }
+
+        $hive_dba->get_RoleAdaptor->print_active_role_counts;
 
         my $workers_to_submit_by_meadow_type_rc_name
-            = Bio::EnsEMBL::Hive::Scheduler::schedule_workers_resync_if_necessary($queen, $valley, $run_analysis);
+            = Bio::EnsEMBL::Hive::Scheduler::schedule_workers_resync_if_necessary($queen, $valley, $list_of_analyses);
 
         if( keys %$workers_to_submit_by_meadow_type_rc_name ) {
 
@@ -364,6 +406,13 @@ sub run_autonomously {
                 make_path( $submit_log_subdir );
             }
 
+                # create an "index" over the freshly loaded RC/RD collections:
+            my %meadow_type_rc_name2resource_param_list = ();
+            foreach my $rd ( $pipeline->collection_of('ResourceDescription')->list ) {
+                my $rc_name = $rd->resource_class->name;
+                $meadow_type_rc_name2resource_param_list{ $rd->meadow_type }{ $rc_name } = [ $rd->submission_cmd_args, $rd->worker_cmd_args ];
+            }
+
             foreach my $meadow_type (keys %$workers_to_submit_by_meadow_type_rc_name) {
 
                 my $this_meadow = $valley->available_meadow_hash->{$meadow_type};
@@ -371,7 +420,7 @@ sub run_autonomously {
                 foreach my $rc_name (keys %{ $workers_to_submit_by_meadow_type_rc_name->{$meadow_type} }) {
                     my $this_meadow_rc_worker_count = $workers_to_submit_by_meadow_type_rc_name->{$meadow_type}{$rc_name};
 
-                    print "Submitting $this_meadow_rc_worker_count workers (rc_name=$rc_name) to ".$this_meadow->signature()."\n";
+                    print "\nBeekeeper : submitting $this_meadow_rc_worker_count workers (rc_name=$rc_name) to ".$this_meadow->signature()."\n";
 
                     my ($submission_cmd_args, $worker_cmd_args) = @{ $meadow_type_rc_name2resource_param_list{ $meadow_type }{ $rc_name } || [] };
 
@@ -379,33 +428,32 @@ sub run_autonomously {
                                             . " -rc_name $rc_name"
                                             . (defined($worker_cmd_args) ? " $worker_cmd_args" : '');
 
-                    if( $self->{'submit_log_dir'} ) {
-                        $self->{'submit_stdout_file'} = $submit_log_subdir . "/log_${rc_name}_%J_%I.out";
-                        $self->{'submit_stderr_file'} = $submit_log_subdir . "/log_${rc_name}_%J_%I.err";
-                    }
-
                     $this_meadow->submit_workers($specific_worker_cmd, $this_meadow_rc_worker_count, $iteration,
-                                                    $rc_name, $submission_cmd_args || '',
-                                                    $self->{'submit_stdout_file'}, $self->{'submit_stderr_file'});
+                                                    $rc_name, $submission_cmd_args || '', $submit_log_subdir);
                 }
             }
         } else {
-            print "Not submitting any workers this iteration\n";
+            print "\nBeekeeper : not submitting any workers this iteration\n";
         }
 
-        $failed_analyses       = $queen->get_num_failed_analyses($run_analysis);
-        $num_of_remaining_jobs = $queen->get_remaining_jobs_show_hive_progress();
+        if( $iteration != $max_loops ) {    # skip the last sleep
+            $hive_dba->dbc->disconnect_if_idle;
+            printf("Beekeeper : going to sleep for %.2f minute(s). Expect next iteration at %s\n", $self->{'sleep_minutes'}, scalar localtime(time+$self->{'sleep_minutes'}*60));
+            sleep($self->{'sleep_minutes'}*60);  
 
-    } while( $keep_alive
-            or (!$failed_analyses and $num_of_remaining_jobs and $iteration!=$max_loops) );
+                # after waking up reload Resources and Analyses to stay current:
+            unless($run_job_id) {
+                    # reset all the collections so that fresher data will be used at this iteration:
+                $pipeline->invalidate_collections();
 
-    print "The Beekeeper has stopped because ".(
-          $failed_analyses ? "there were $failed_analyses failed analyses"
-        : !$num_of_remaining_jobs ? "there is nothing left to do"
-        : "the number of loops was limited by $max_loops and this limit expired"
-    )."\n";
+                $list_of_analyses = $pipeline->collection_of('Analysis')->find_all_by_pattern( $analyses_pattern );
+            }
+        }
+    }
 
-    printf("dbc %d disconnect cycles\n", $self->{'dba'}->dbc->disconnect_count);
+    print "Beekeeper : stopped looping because ".( $reasons_to_exit || "the number of loops was limited by $max_loops and this limit expired\n");
+
+    printf("Beekeeper: dbc %d disconnect cycles\n", $hive_dba->dbc->disconnect_count);
 }
 
 
@@ -415,7 +463,7 @@ __DATA__
 
 =head1 NAME
 
-    beekeeper.pl
+    beekeeper.pl [options]
 
 =head1 DESCRIPTION
 
@@ -437,14 +485,14 @@ __DATA__
         # Run the pipeline in automatic mode (-loop), run all the workers locally (-meadow_type LOCAL) and allow for 3 parallel workers (-total_running_workers_max 3)
     beekeeper.pl -url mysql://username:secret@hostname:port/long_mult_test -meadow_type LOCAL -total_running_workers_max 3 -loop
 
-        # Run in automatic mode, but only restrict to running the 'fast_blast' analysis
-    beekeeper.pl -url mysql://username:secret@hostname:port/long_mult_test -logic_name fast_blast -loop
+        # Run in automatic mode, but only restrict to running blast-related analyses with the exception of analyses 4..6
+    beekeeper.pl -url mysql://username:secret@hostname:port/long_mult_test -analyses_pattern 'blast%-4..6' -loop
 
         # Restrict the normal execution to one iteration only - can be used for testing a newly set up pipeline
     beekeeper.pl -url mysql://username:secret@hostname:port/long_mult_test -run
 
         # Reset failed 'buggy_analysis' jobs to 'READY' state, so that they can be run again
-    beekeeper.pl -url mysql://username:secret@hostname:port/long_mult_test -reset_failed_jobs_for_analysis buggy_analysis
+    beekeeper.pl -url mysql://username:secret@hostname:port/long_mult_test -analyses_pattern buggy_analysis -reset_failed_jobs
 
         # Do a cleanup: find and bury dead workers, reclaim their jobs
     beekeeper.pl -url mysql://username:secret@hostname:port/long_mult_test -dead
@@ -458,6 +506,10 @@ __DATA__
     -reg_alias <string>    : species/alias name for the Hive DBAdaptor
     -url <url string>      : url defining where hive database is located
 
+=head2 Configs overriding
+
+    -config_file <string>  : json file (with absolute path) to override the default configurations (could be multiple)
+
 =head2 Looping control
 
     -loop                  : run autonomously, loops and sleeps
@@ -465,7 +517,7 @@ __DATA__
     -keep_alive            : do not stop when there are no more jobs to do - carry on looping
     -job_id <job_id>       : run 1 iteration for this job_id
     -run                   : run 1 iteration of automation loop
-    -sleep <num>           : when looping, sleep <num> minutes (default 2min)
+    -sleep <num>           : when looping, sleep <num> minutes (default 1 min)
 
 =head2 Current Meadow control
 
@@ -477,11 +529,11 @@ __DATA__
 
 =head2 Worker control
 
-    -job_limit <num>            : #jobs to run before worker can die naturally
-    -life_span <num>            : life_span limit for each worker
-    -logic_name <string>        : restrict the pipeline stat/runs to this analysis logic_name
-    -retry_throwing_jobs 0|1    : if a job dies *knowingly*, should we retry it by default?
+    -analyses_pattern <string>  : restrict the sync operation, printing of stats or looping of the beekeeper to the specified subset of analyses
     -can_respecialize <0|1>     : allow workers to re-specialize into another analysis (within resource_class) after their previous analysis was exhausted
+    -life_span <num>            : life_span limit for each worker
+    -job_limit <num>            : #jobs to run before worker can die naturally
+    -retry_throwing_jobs 0|1    : if a job dies *knowingly*, should we retry it by default?
     -hive_log_dir <path>        : directory where stdout/stderr of the hive is redirected
     -debug <debug_level>        : set debug level of the workers
 
@@ -490,20 +542,19 @@ __DATA__
     -help                  : print this help
     -versions              : report both Hive code version and Hive database schema version
     -dead                  : detect all unaccounted dead workers and reset their jobs for resubmission
+    -unkwn                 : detect all workers in UNKWN state and reset their jobs for resubmission (careful, they *may* reincarnate!)
     -alldead               : tell the database all workers are dead (no checks are performed in this mode, so be very careful!)
     -balance_semaphores    : set all semaphore_counts to the numbers of unDONE fan jobs (emergency use only)
     -no_analysis_stats     : don't show status of each analysis
     -worker_stats          : show status of each running worker
     -failed_jobs           : show all failed jobs
     -reset_job_id <num>    : reset a job back to READY so it can be rerun
-    -reset_failed_jobs_for_analysis <logic_name>
-                           : reset FAILED jobs of an analysis back to READY so they can be rerun
-    -reset_all_jobs_for_analysis <logic_name>
-                           : reset ALL jobs of an analysis back to READY so they can be rerun
+    -reset_failed_jobs     : reset FAILED jobs of -analyses_filter'ed ones back to READY so they can be rerun
+    -reset_all_jobs        : reset ALL jobs of -analyses_filter'ed ones back to READY so they can be rerun
 
 =head1 LICENSE
 
-    Copyright [1999-2014] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
+    Copyright [1999-2015] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
 
     Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
     You may obtain a copy of the License at

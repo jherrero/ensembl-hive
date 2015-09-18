@@ -34,6 +34,8 @@ The following parameters are accepted:
  - output_db [string] : URL of a database to write the dump to. In this
     mode, the Runnable acts like MySQLTransfer
 
+ - skip_dump [boolean=0] : set this to 1 to skip the dump
+
 If "table_list" is undefined or maps to an empty list, the list
 of tables to be dumped is decided accordingly to "exclude_list" (EL)
 and "exclude_ehive" (EH). "exclude_list" controls the whole list of
@@ -57,7 +59,7 @@ EL EH    List of tables to dump
 
 =head1 LICENSE
 
-    Copyright [1999-2014] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
+    Copyright [1999-2015] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
 
     Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
     You may obtain a copy of the License at
@@ -84,6 +86,23 @@ use Bio::EnsEMBL::Hive::Utils ('go_figure_dbc');
 
 use base ('Bio::EnsEMBL::Hive::Process');
 
+sub param_defaults {
+    return {
+        # Which tables to dump. How the options are combined is explained above
+        'table_list'    => undef,   # array-ref
+        'exclude_ehive' => 0,       # boolean
+        'exclude_list'  => 0,       # boolean
+
+        # Input / output
+        'src_db_conn'   => undef,   # URL, hash-ref, or Registry name
+        'output_file'   => undef,   # String
+        'output_db'     => undef,   # URL, hash-ref, or Registry name
+
+        # Other options
+        'skip_dump'     => 0,       # boolean
+    }
+}
+
 sub fetch_input {
     my $self = shift @_;
 
@@ -93,10 +112,6 @@ sub fetch_input {
     my @ignores = ();
     $self->param('ignores', \@ignores);
 
-    # Would be good to have this from eHive
-    my @ehive_tables = qw(hive_meta pipeline_wide_parameters worker dataflow_rule analysis_base analysis_ctrl_rule job accu log_message job_file analysis_data resource_description analysis_stats analysis_stats_monitor msg progress resource_class);
-    $self->param('nb_ehive_tables', scalar(@ehive_tables));
-
     # Connection parameters
     my $src_db_conn  = $self->param('src_db_conn');
     my $src_dbc = $src_db_conn ? go_figure_dbc($src_db_conn) : $self->data_dbc;
@@ -104,6 +119,18 @@ sub fetch_input {
 
     $self->input_job->transient_error(0);
     die 'Only the "mysql" driver is supported.' if $src_dbc->driver ne 'mysql';
+
+    my @ehive_tables = ();
+    {
+        ## Only query the list of eHive tables if there is a "hive_meta" table
+        my $meta_sth = $src_dbc->db_handle->table_info(undef, undef, 'hive_meta');
+        if ($meta_sth->fetchrow_arrayref) {
+            my $src_dba = Bio::EnsEMBL::Hive::DBSQL::DBAdaptor->new( -dbconn => $src_dbc, -disconnect_when_inactive => 1, -no_sql_schema_version_check => 1 );
+            @ehive_tables = (@{$src_dba->list_all_hive_tables}, @{$src_dba->list_all_hive_views});
+        }
+        $meta_sth->finish();
+    }
+    $self->param('nb_ehive_tables', scalar(@ehive_tables));
 
     # Get the table list in either "tables" or "ignores"
     my $table_list = $self->_get_table_list;
@@ -179,12 +206,12 @@ sub run {
             $output = sprintf('> %s', $self->param('output_file'));
         }
     } else {
-        $output = sprintf(' | mysql %s', $self->mysql_conn_from_dbc($self->param('real_output_db')));
+        $output = join(' ', '|', @{ $self->param('real_output_db')->to_cmd(undef, undef, undef, undef, 1) } );
     };
 
+    # Must be joined because of the redirection / the pipe
     my $cmd = join(' ', 
-        'mysqldump',
-        $self->mysql_conn_from_dbc($src_dbc),
+        @{ $src_dbc->to_cmd('mysqldump', undef, undef, undef, 1) },
         '--skip-lock-tables',
         @$tables,
         (map {sprintf('--ignore-table=%s.%s', $src_dbc->dbname, $_)} @$ignores),
@@ -192,20 +219,26 @@ sub run {
     );
     print "$cmd\n" if $self->debug;
 
-    # We have to skip the dump
-    return if ($self->param('skip_dump'));
+    # Check whether the current database has been restored from a snapshot.
+    # If it is the case, we shouldn't re-dump and overwrite the file.
+    # We also check here the value of the "skip_dump" parameter
+    my $completion_signature = sprintf('dump_%d_restored', $self->input_job->dbID < 0 ? 0 : $self->input_job->dbID);
+    return if $self->param('skip_dump') or $self->param($completion_signature);
 
     # OK, we can dump
     if(my $return_value = system($cmd)) {
         die "system( $cmd ) failed: $return_value";
     }
-}
 
-
-sub mysql_conn_from_dbc {
-    my ($self, $dbc) = @_; 
-
-    return '--host='.$dbc->host.' --port='.$dbc->port." --user='".$dbc->username."' --password='".$dbc->password."' ".$dbc->dbname;
+    # We add the signature to the dump, so that the job won't rerun on a
+    # restored database
+    my $extra_sql = qq{echo "INSERT INTO pipeline_wide_parameters VALUES ('$completion_signature', 1);\n" $output};
+    # We're very lucky that gzipped streams can be concatenated and the
+    # output is still valid !
+    $extra_sql =~ s/>/>>/;
+    if(my $return_value = system($extra_sql)) {
+        die "system( $extra_sql ) failed: $return_value";
+    }
 }
 
 

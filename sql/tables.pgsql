@@ -8,14 +8,15 @@
             -sort_headers 0 -sort_tables 0 -o $ENSEMBL_CVS_ROOT_DIR/ensembl-hive/docs/hive_schema.html
 
 
-    Adding the following line into the header of the previous output will make it look prettier (valid in rel.75):
-        <link rel="stylesheet" type="text/css" media="all" href="http://static.ensembl.org/minified/fb4f89868f04f558d1d4421999719047.css" />
+    Adding the following line into the header of the previous output will make it look prettier:
+        <link rel="stylesheet" type="text/css" media="all" href="ehive_doc.css" />
+
 
 
 
 LICENSE
 
-    Copyright [1999-2014] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
+    Copyright [1999-2015] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
 
     Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
     You may obtain a copy of the License at
@@ -88,7 +89,8 @@ CREATE        INDEX ON pipeline_wide_parameters (param_value);
 
 @column analysis_id             a unique ID that is also a foreign key to most of the other tables
 @column logic_name              the name of the Analysis object
-@column module                  the Perl module name that runs this Analysis
+@column module                  the name of the module / package that runs this Analysis
+@column language                the language of the module, if not Perl
 @column parameters              a stingified hash of parameters common to all jobs of the Analysis
 @column resource_class_id       link to the resource_class table
 @column failed_job_tolerance    % of tolerated failed Jobs
@@ -102,7 +104,8 @@ CREATE        INDEX ON pipeline_wide_parameters (param_value);
 CREATE TABLE analysis_base (
     analysis_id             SERIAL PRIMARY KEY,
     logic_name              VARCHAR(255) NOT NULL,
-    module                  VARCHAR(255),
+    module                  VARCHAR(255) NOT NULL,
+    language                VARCHAR(255),
     parameters              TEXT,
     resource_class_id       INTEGER     NOT NULL,
     failed_job_tolerance    INTEGER     NOT NULL DEFAULT 0,
@@ -138,7 +141,6 @@ CREATE TABLE analysis_base (
 @column failed_job_count        number of Jobs of this Analysis that are in FAILED state
 
 @column num_running_workers     number of running Workers of this Analysis
-@column num_required_workers    extra number of Workers of this Analysis needed to execute all READY jobs
 
 @column behaviour               whether hive_capacity is set or is dynamically calculated based on timers
 @column input_capacity          used to compute hive_capacity in DYNAMIC mode
@@ -149,7 +151,7 @@ CREATE TABLE analysis_base (
 @column avg_run_msec_per_job    weighted average used to compute DYNAMIC hive_capacity
 @column avg_output_msec_per_job weighted average used to compute DYNAMIC hive_capacity
 
-@column last_update             when this entry was last updated
+@column when_updated            when this entry was last updated
 @column sync_lock               a binary lock flag to prevent simultaneous updates
 */
 
@@ -166,8 +168,8 @@ CREATE TABLE analysis_stats (
     ready_job_count         INTEGER     NOT NULL DEFAULT 0,
     done_job_count          INTEGER     NOT NULL DEFAULT 0,
     failed_job_count        INTEGER     NOT NULL DEFAULT 0,
+
     num_running_workers     INTEGER     NOT NULL DEFAULT 0,
-    num_required_workers    INTEGER     NOT NULL DEFAULT 0,
 
     behaviour               analysis_behaviour NOT NULL DEFAULT 'STATIC',
     input_capacity          INTEGER     NOT NULL DEFAULT 4,
@@ -178,7 +180,7 @@ CREATE TABLE analysis_stats (
     avg_run_msec_per_job    INTEGER              DEFAULT NULL,
     avg_output_msec_per_job INTEGER              DEFAULT NULL,
 
-    last_update             TIMESTAMP            DEFAULT NULL,
+    when_updated            TIMESTAMP            DEFAULT NULL,
     sync_lock               SMALLINT    NOT NULL DEFAULT 0,
 
     PRIMARY KEY (analysis_id)
@@ -315,18 +317,15 @@ CREATE TABLE resource_description (
 @column input_id                input data passed into Analysis:RunnableDB to control the work
 @column param_id_stack          a CSV of job_ids whose input_ids contribute to the stack of local variables for the job
 @column accu_id_stack           a CSV of job_ids whose accu's contribute to the stack of local variables for the job
-@column worker_id               link to worker table to define which worker claimed this job
+@column role_id                 links to the Role that claimed this job (NULL means it has never been claimed)
 @column status                  state the job is in
 @column retry_count             number times job had to be reset when worker failed to run it
-@column completed               when the job was completed
+@column when_completed          when the job was completed
 @column runtime_msec            how long did it take to execute the job (or until the moment it failed)
 @column query_count             how many SQL queries were run during this job
 @column semaphore_count         if this count is >0, the job is conditionally blocked (until this count drops to 0 or below). Default=0 means "nothing is blocking me by default".
 @column semaphored_job_id       the job_id of job S that is waiting for this job to decrease S's semaphore_count. Default=NULL means "I'm not blocking anything by default".
 */
-
--- union enum status for job and worker
-CREATE TYPE jw_status AS ENUM ('UNKNOWN','SPECIALIZATION','COMPILATION','SEMAPHORED','READY','CLAIMED','PRE_CLEANUP','FETCH_INPUT','RUN','WRITE_OUTPUT','POST_CLEANUP','DONE','FAILED','PASSED_ON','DEAD');
 
 CREATE TABLE job (
     job_id                  SERIAL PRIMARY KEY,
@@ -335,10 +334,10 @@ CREATE TABLE job (
     input_id                TEXT        NOT NULL,
     param_id_stack          TEXT        NOT NULL DEFAULT '',
     accu_id_stack           TEXT        NOT NULL DEFAULT '',
-    worker_id               INTEGER              DEFAULT NULL,
-    status                  jw_status   NOT NULL DEFAULT 'READY',
+    role_id                 INTEGER              DEFAULT NULL,
+    status                  TEXT        NOT NULL DEFAULT 'READY',   -- expected values: 'SEMAPHORED','READY','CLAIMED','COMPILATION','PRE_CLEANUP','FETCH_INPUT','RUN','WRITE_OUTPUT','POST_HEALTHCHECK','POST_CLEANUP','DONE','FAILED','PASSED_ON'
     retry_count             INTEGER     NOT NULL DEFAULT 0,
-    completed               TIMESTAMP            DEFAULT NULL,
+    when_completed          TIMESTAMP            DEFAULT NULL,
     runtime_msec            INTEGER              DEFAULT NULL,
     query_count             INTEGER              DEFAULT NULL,
 
@@ -348,7 +347,7 @@ CREATE TABLE job (
     UNIQUE (input_id, param_id_stack, accu_id_stack, analysis_id)   -- to avoid repeating tasks
 );
 CREATE INDEX ON job (analysis_id, status, retry_count); -- for claiming jobs
-CREATE INDEX ON job (worker_id, status);                -- for fetching and releasing claimed jobs
+CREATE INDEX ON job (role_id, status);                  -- for fetching and releasing claimed jobs
 
 
 /**
@@ -362,7 +361,7 @@ CREATE INDEX ON job (worker_id, status);                -- for fetching and rele
         There is max one entry per job_id and retry.
 
 @column job_id             foreign key
-@column worker_id          link to worker table to define which worker claimed this job
+@column role_id            links to the Role that claimed this job
 @column retry              copy of retry_count of job as it was run
 @column stdout_file        path to the job's STDOUT log
 @column stderr_file        path to the job's STDERR log
@@ -371,13 +370,13 @@ CREATE INDEX ON job (worker_id, status);                -- for fetching and rele
 CREATE TABLE job_file (
     job_id                  INTEGER     NOT NULL,
     retry                   INTEGER     NOT NULL,
-    worker_id               INTEGER     NOT NULL,
+    role_id                 INTEGER     NOT NULL,
     stdout_file             VARCHAR(255),
     stderr_file             VARCHAR(255),
 
     PRIMARY KEY (job_id, retry)
 );
-CREATE INDEX ON job_file (worker_id);
+CREATE INDEX ON job_file (role_id);
 
 
 /**
@@ -427,7 +426,7 @@ CREATE INDEX ON analysis_data (data);
 
 
 /**
-@header worker table
+@header execution tables
 @colour #24DA06
 */
 
@@ -443,16 +442,17 @@ CREATE INDEX ON analysis_data (data);
 
 @column worker_id           unique ID of the Worker
 @column meadow_type         type of the Meadow it is running on
-@column meadow_name         name of the Meadow it is running on (for 'LOCAL' type is the same as host)
-@column host                execution host name
+@column meadow_name         name of the Meadow it is running on (for meadow_type=='LOCAL' it is the same as meadow_host)
+@column meadow_host         execution host name
+@column meadow_user         scheduling/execution user name (within the Meadow)
 @column process_id          identifies the Worker process on the Meadow (for 'LOCAL' is the OS PID)
 @column resource_class_id   links to Worker's resource class
-@column analysis_id         Analysis the Worker is specified into
 @column work_done           how many jobs the Worker has completed successfully
 @column status              current status of the Worker
-@column born                when the Worker process was started
-@column last_check_in       when the Worker last checked into the database
-@column died                if defined, when the Worker died (or its premature death was first detected by GC)
+@column when_born           when the Worker process was started
+@column when_checked_in     when the Worker last checked into the database
+@column when_seen           when the Worker was last seen by the Meadow
+@column when_died           if defined, when the Worker died (or its premature death was first detected by GC)
 @column cause_of_death      if defined, why did the Worker exit (or why it was killed)
 @column log_dir             if defined, a filesystem directory where this Worker's output is logged
 */
@@ -462,20 +462,52 @@ CREATE TABLE worker (
     worker_id               SERIAL PRIMARY KEY,
     meadow_type             VARCHAR(255) NOT NULL,
     meadow_name             VARCHAR(255) NOT NULL,
-    host                    VARCHAR(255) NOT NULL,
+    meadow_host             VARCHAR(255) NOT NULL,
+    meadow_user             VARCHAR(255)         DEFAULT NULL,
     process_id              VARCHAR(255) NOT NULL,
     resource_class_id       INTEGER              DEFAULT NULL,
-
-    analysis_id             INTEGER              DEFAULT NULL,
-    work_done               INTEGER     NOT NULL DEFAULT 0,
-    status                  jw_status   NOT NULL DEFAULT 'READY',
-    born                    TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    last_check_in           TIMESTAMP   NOT NULL,
-    died                    TIMESTAMP            DEFAULT NULL,
+    work_done               INTEGER      NOT NULL DEFAULT 0,
+    status                  VARCHAR(255) NOT NULL DEFAULT 'READY',  -- expected values: 'SPECIALIZATION','COMPILATION','READY','JOB_LIFECYCLE','DEAD'
+    when_born               TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    when_checked_in         TIMESTAMP            DEFAULT NULL,
+    when_seen               TIMESTAMP            DEFAULT NULL,
+    when_died               TIMESTAMP            DEFAULT NULL,
     cause_of_death          worker_cod           DEFAULT NULL,
     log_dir                 VARCHAR(255)         DEFAULT NULL
 );
-CREATE INDEX ON worker (analysis_id, status);
+CREATE INDEX ON worker (meadow_type, meadow_name, process_id);
+
+
+/**
+@table  role
+
+@colour #24DA06
+
+@desc Entries of this table correspond to Role objects of the API.
+        When a Worker specializes, it acquires a Role,
+        which is a temporary link between the Worker and a resource-compatible Analysis.
+
+@column role_id             unique ID of the Role
+@column worker_id           the specialized Worker
+@column analysis_id         the Analysis into which the Worker specialized
+@column when_started        when this Role started
+@column when_finished       when this Role finished. NULL may either indicate it is still running or was killed by an external force.
+@column attempted_jobs      counter of the number of attempts
+@column done_jobs           counter of the number of successful attempts
+*/
+
+CREATE TABLE role (
+    role_id                 SERIAL PRIMARY KEY,
+    worker_id               INTEGER     NOT NULL,
+    analysis_id             INTEGER     NOT NULL,
+    when_started            TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    when_finished           TIMESTAMP            DEFAULT NULL,
+    attempted_jobs          INTEGER     NOT NULL DEFAULT 0,
+    done_jobs               INTEGER     NOT NULL DEFAULT 0
+);
+CREATE        INDEX role_worker_id_idx ON role (worker_id);
+CREATE        INDEX role_analysis_id_idx ON role (analysis_id);
+
 
 
 /**
@@ -505,9 +537,9 @@ CREATE TABLE worker_resource_usage (
     exit_status             VARCHAR(255)    DEFAULT NULL,
     mem_megs                FLOAT           DEFAULT NULL,
     swap_megs               FLOAT           DEFAULT NULL,
-    pending_sec             INTEGER         DEFAULT NULL,
+    pending_sec             FLOAT           DEFAULT NULL,
     cpu_sec                 FLOAT           DEFAULT NULL,
-    lifespan_sec            INTEGER         DEFAULT NULL,
+    lifespan_sec            FLOAT           DEFAULT NULL,
     exception_status        VARCHAR(255)    DEFAULT NULL,
 
     PRIMARY KEY (worker_id)
@@ -526,8 +558,9 @@ CREATE TABLE worker_resource_usage (
 
 @column log_message_id  an autoincremented primary id of the message
 @column         job_id  the id of the job that threw the message (or NULL if it was outside of a message)
+@column        role_id  the 'current' role
 @column      worker_id  the 'current' worker
-@column           time  when the message was thrown
+@column    when_logged  when the message was thrown
 @column          retry  retry_count of the job when the message was thrown (or NULL if no job)
 @column         status  of the job or worker when the message was thrown
 @column            msg  string that contains the message
@@ -537,10 +570,11 @@ CREATE TABLE worker_resource_usage (
 CREATE TABLE log_message (
     log_message_id          SERIAL PRIMARY KEY,
     job_id                  INTEGER              DEFAULT NULL,
+    role_id                 INTEGER              DEFAULT NULL,
     worker_id               INTEGER              DEFAULT NULL,
-    time                    TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    when_logged             TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP,
     retry                   INTEGER              DEFAULT NULL,
-    status                  jw_status            DEFAULT 'UNKNOWN',
+    status                  VARCHAR(255) NOT NULL DEFAULT 'UNKNOWN',
     msg                     TEXT,
     is_error                SMALLINT
 
@@ -556,7 +590,7 @@ CREATE INDEX ON log_message (job_id);
 
 @desc   A regular timestamped snapshot of the analysis_stats table.
 
-@column time                    when this snapshot was taken
+@column when_logged             when this snapshot was taken
 
 @column analysis_id             foreign-keyed to the corresponding analysis_base entry
 @column batch_size              how many jobs are claimed in one claiming operation before Worker starts executing them
@@ -570,7 +604,6 @@ CREATE INDEX ON log_message (job_id);
 @column failed_job_count        number of Jobs of this Analysis that are in FAILED state
 
 @column num_running_workers     number of running Workers of this Analysis
-@column num_required_workers    extra number of Workers of this Analysis needed to execute all READY jobs
 
 @column behaviour               whether hive_capacity is set or is dynamically calculated based on timers
 @column input_capacity          used to compute hive_capacity in DYNAMIC mode
@@ -581,12 +614,12 @@ CREATE INDEX ON log_message (job_id);
 @column avg_run_msec_per_job    weighted average used to compute DYNAMIC hive_capacity
 @column avg_output_msec_per_job weighted average used to compute DYNAMIC hive_capacity
 
-@column last_update             when this entry was last updated
+@column when_updated            when this entry was last updated
 @column sync_lock               a binary lock flag to prevent simultaneous updates
 */
 
 CREATE TABLE analysis_stats_monitor (
-    time                    TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    when_logged             TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     analysis_id             INTEGER     NOT NULL,
     batch_size              INTEGER     NOT NULL DEFAULT 1,
@@ -598,8 +631,8 @@ CREATE TABLE analysis_stats_monitor (
     ready_job_count         INTEGER     NOT NULL DEFAULT 0,
     done_job_count          INTEGER     NOT NULL DEFAULT 0,
     failed_job_count        INTEGER     NOT NULL DEFAULT 0,
+
     num_running_workers     INTEGER     NOT NULL DEFAULT 0,
-    num_required_workers    INTEGER     NOT NULL DEFAULT 0,
 
     behaviour               analysis_behaviour NOT NULL DEFAULT 'STATIC',
     input_capacity          INTEGER     NOT NULL DEFAULT 4,
@@ -610,7 +643,7 @@ CREATE TABLE analysis_stats_monitor (
     avg_run_msec_per_job    INTEGER              DEFAULT NULL,
     avg_output_msec_per_job INTEGER              DEFAULT NULL,
 
-    last_update             TIMESTAMP            DEFAULT NULL,
+    when_updated            TIMESTAMP            DEFAULT NULL,
     sync_lock               SMALLINT    NOT NULL DEFAULT 0
 
 );

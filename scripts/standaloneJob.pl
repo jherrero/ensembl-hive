@@ -16,78 +16,52 @@ use Getopt::Long qw(:config pass_through);
 use Bio::EnsEMBL::Hive::Process;
 use Bio::EnsEMBL::Hive::AnalysisJob;
 use Bio::EnsEMBL::Hive::Utils ('script_usage', 'load_file_or_module', 'parse_cmdline_options', 'stringify', 'destringify');
-
-my ($reg_conf, $help, $debug, $no_write, $no_cleanup, $flow_into, $input_id);
-
-my $module_or_file = shift @ARGV or script_usage();
-
-GetOptions(
-           'help'               => \$help,
-           'debug=i'            => \$debug,
-           'reg_conf|regfile=s' => \$reg_conf,
-           'no_write'           => \$no_write,
-           'no_cleanup'         => \$no_cleanup,
-           'flow_into|flow=s'   => \$flow_into,
-           'input_id=s'         => \$input_id,
-);
-
-if ($help or !$module_or_file) {
-    script_usage(0);
-}
-
-my $runnable_module = load_file_or_module( $module_or_file );
-
-if($reg_conf) {
-    require Bio::EnsEMBL::Registry;
-    Bio::EnsEMBL::Registry->load_all($reg_conf);
-}
-
-my $runnable_object = $runnable_module->new();
-$runnable_object->debug($debug) if($debug);
-$runnable_object->execute_writes(not $no_write);
+use Bio::EnsEMBL::Hive::Scripts::StandaloneJob;
 
 
-my $job = Bio::EnsEMBL::Hive::AnalysisJob->new( 'dbID' => -1 );
-unless($input_id) {
-    my ($param_hash, $param_list) = parse_cmdline_options();
-    $input_id = stringify($param_hash);
-}
-$job->input_id( $input_id );
-warn "\nRunning '$runnable_module' with input_id='$input_id' :\n";
+main();
 
-$job->param_init( $runnable_object->strict_hash_format(), $runnable_object->param_defaults(), $job->input_id() );
 
-$flow_into = $flow_into ? destringify($flow_into) : []; # empty dataflow for branch 1 by default
-$flow_into = { 1 => $flow_into } unless(ref($flow_into) eq 'HASH'); # force non-hash into a hash
-foreach my $branch_code (keys %$flow_into) {
-    my $heirs = $flow_into->{$branch_code};
+sub main {
+    my ($reg_conf, $help, $debug, $no_write, $no_cleanup, $flow_into, $input_id, $language);
 
-    $heirs = [ $heirs ] unless(ref($heirs)); # force scalar into an arrayref first
-    $heirs = { map { ($_ => undef) } @$heirs } if(ref($heirs) eq 'ARRAY'); # now force it into a hash if it wasn't
+    my $module_or_file = shift @ARGV or script_usage();
 
-    my @dataflow_rules = ();
+    GetOptions(
+               'help'               => \$help,
+               'debug=i'            => \$debug,
+               'reg_conf|regfile=s' => \$reg_conf,
+               'no_write'           => \$no_write,
+               'no_cleanup'         => \$no_cleanup,
+               'flow_into|flow=s'   => \$flow_into,
+               'input_id=s'         => \$input_id,
+               'language=s'         => \$language,
+    );
 
-    while(my ($heir_url, $input_id_template_list) = each %$heirs) {
-
-        $input_id_template_list = [ $input_id_template_list ] unless(ref($input_id_template_list) eq 'ARRAY');  # allow for more than one template per analysis
-
-        foreach my $input_id_template (@$input_id_template_list) {
-
-            push @dataflow_rules, Bio::EnsEMBL::Hive::DataflowRule->new(
-                'to_analysis_url'   => $heir_url,
-                'input_id_template' => $input_id_template,
-            );
-        }
+    if ($help or !$module_or_file) {
+        script_usage(0);
     }
 
-    $job->dataflow_rules( $branch_code, \@dataflow_rules );
+    if($reg_conf) {
+        require Bio::EnsEMBL::Registry;
+        Bio::EnsEMBL::Registry->load_all($reg_conf);
+    }
+
+    unless($input_id) {
+        my ($param_hash, $param_list) = parse_cmdline_options();
+        $input_id = stringify($param_hash);
+    }
+    warn "\nRunning '$module_or_file' with input_id='$input_id' :\n";
+
+    my %flags = (
+        no_write    => $no_write,
+        no_cleanup  => $no_cleanup,
+        debug       => $debug,
+    );
+    my $job_successful = Bio::EnsEMBL::Hive::Scripts::StandaloneJob::standaloneJob($module_or_file, $input_id, \%flags, $flow_into, $language);
+    exit(1) unless $job_successful;
 }
 
-
-$runnable_object->input_job($job);
-$runnable_object->life_cycle();
-
-$runnable_object->cleanup_worker_temp_directory() unless($no_cleanup);
 
 __DATA__
 
@@ -138,6 +112,10 @@ __DATA__
     standaloneJob.pl Bio::EnsEMBL::Hive::RunnableDB::Dummy -a_multiplier 1234567 -b_multiplier 9876543 \
                         -flow_into "{ 1 => 'mysql://ensadmin:xxxxxxx@127.0.0.1/lg4_long_mult/analysis?logic_name=start' }"
 
+        # Produce a semaphore group of jobs from a database-less DigitFactory job:
+    standaloneJob.pl Bio::EnsEMBL::Hive::RunnableDB::LongMult::DigitFactory -input_id "{ 'a_multiplier' => '2222222222', 'b_multiplier' => '3434343434'}" \
+        -flow_into "{ '2->A' => 'mysql://ensadmin:${ENSADMIN_PSW}@127.0.0.1/lg4_long_mult/analysis?logic_name=part_multiply', 'A->1' => 'mysql://ensadmin:${ENSADMIN_PSW}@127.0.0.1/lg4_long_mult/analysis?logic_name=add_together' }" 
+
 
 =head1 SCRIPT-SPECIFIC OPTIONS
 
@@ -152,7 +130,7 @@ __DATA__
 
 =head1 LICENSE
 
-    Copyright [1999-2014] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
+    Copyright [1999-2015] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
 
     Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
     You may obtain a copy of the License at

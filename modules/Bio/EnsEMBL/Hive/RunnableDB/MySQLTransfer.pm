@@ -18,7 +18,7 @@
 
 =head1 LICENSE
 
-    Copyright [1999-2014] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
+    Copyright [1999-2015] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
 
     Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
     You may obtain a copy of the License at
@@ -120,16 +120,19 @@ sub run {
     my $where       = $self->param('where');
     my $filter_cmd  = $self->param('filter_cmd');
 
-    my $cmd = 'mysqldump '
-                . { 'overwrite' => '', 'topup' => '--no-create-info ', 'insertignore' => '--no-create-info --insert-ignore ' }->{$mode}
-                . $self->mysql_conn_from_dbc($src_dbc)
-                . " $table "
-                . (defined($where) ? "--where '$where' " : '')
-                . '| '
-                . ($filter_cmd ? "$filter_cmd | " : '')
-                . 'mysql '
-                . $self->mysql_conn_from_dbc($dest_dbc);
+    my $mode_options = { 'overwrite' => [], 'topup' => ['--no-create-info'], 'insertignore' => [qw(--no-create-info --insert-ignore)] }->{$mode};
 
+    # Must be joined because of the pipe
+    my $cmd = join(' ',
+                @{$src_dbc->to_cmd('mysqldump', $mode_options, undef, undef, 1)},
+                $table,
+                (defined($where) ? "--where '$where' " : ''),
+                '|',
+                ($filter_cmd ? "$filter_cmd | " : ''),
+                @{$dest_dbc->to_cmd(undef, undef, undef, undef, 1)}
+            );
+
+    print "$cmd\n" if $self->debug;
     if(my $return_value = system($cmd)) {   # NB: unfortunately, this code won't catch many errors because of the pipe
         $return_value >>= 8;
         die "system( $cmd ) failed: $return_value";
@@ -191,12 +194,6 @@ sub get_row_count {
     $sth->finish;
 
     return $row_count;
-}
-
-sub mysql_conn_from_dbc {
-    my ($self, $dbc) = @_;
-
-    return '--host='.$dbc->host.' --port='.$dbc->port." --user='".$dbc->username."' --password='".$dbc->password."' ".$dbc->dbname;
 }
 
 1;

@@ -1,0 +1,46 @@
+language: "perl"
+
+perl:
+  - "5.10"
+  - "5.14"
+
+env:
+  - COVERALLS=true
+  - COVERALLS=false
+
+sudo: false
+
+addons:
+  apt:
+    packages:
+    - unzip
+    - python3
+
+before_install:
+    - wget https://github.com/bioperl/bioperl-live/archive/bioperl-release-1-2-3.zip
+    - unzip bioperl-release-1-2-3.zip
+    - echo -e '#!/bin/bash\n\nperl '`which psql`' "$@"' > psql
+    - chmod +x psql
+    - export PATH=$PWD:$PATH
+    - ln -s /usr/share/perl5/PgCommon.pm modules/
+
+
+install:
+    - cpanm -v --installdeps --notest .
+    - cpanm -n Devel::Cover::Report::Coveralls
+
+script: "./scripts/travis_run_tests.sh"
+
+notifications:
+  email:
+    on_success: always
+    on_failure: always
+
+# Get the matrix to only build coveralls support when on 5.10
+matrix:
+  exclude:
+    - perl: "5.10"
+      env: COVERALLS=false
+    - perl: "5.14"
+      env: COVERALLS=true
+

@@ -6,7 +6,7 @@
 
 =head1 SYNOPSIS
 
-    use Bio::EnsEMBL::Hive::Version 2.0;
+    use Bio::EnsEMBL::Hive::Version 2.4;
 
 =head1 DESCRIPTION
 
@@ -14,7 +14,7 @@
 
 =head1 LICENSE
 
-    Copyright [1999-2014] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
+    Copyright [1999-2015] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
 
     Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
     You may obtain a copy of the License at
@@ -37,7 +37,7 @@ package Bio::EnsEMBL::Hive::Version;
 use strict;
 use warnings;
 
-our $VERSION = '2.1';
+our $VERSION = '2.4';
 
 sub get_code_version {
 

@@ -11,7 +11,7 @@
 
 =head1 LICENSE
 
-    Copyright [1999-2014] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
+    Copyright [1999-2015] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
 
     Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
     You may obtain a copy of the License at
@@ -31,11 +31,16 @@
 
 package Bio::EnsEMBL::Hive::Limiter;
 
+use strict;
+use warnings;
+
 sub new {
     my ($class, $description, $available_capacity) = @_;
 
     my $self = bless {}, $class;
     $self->description( $description );
+
+    $self->original_capacity( $available_capacity );
     $self->available_capacity( $available_capacity );
 
         # we fix the multiplier at 1 for direct limiters, but expect it to be (re)set later by reciprocal limiters:
@@ -52,6 +57,16 @@ sub description {
         $self->{_description} = shift @_;
     }
     return $self->{_description};
+}
+
+
+sub original_capacity {
+    my $self = shift @_;
+
+    if(@_) {
+        $self->{_original_capacity} = shift @_;
+    }
+    return $self->{_original_capacity};
 }
 
 
@@ -90,13 +105,17 @@ sub preliminary_offer {
 
     if( defined($available_capacity) and defined($multiplier) and ($multiplier >= 0.0) ) {  # if multiplier is negative it is not limiting
 
+        $available_capacity = 0 if($available_capacity<0);
+
         my $product = $available_capacity * $multiplier;
         my $slots_available = int( "$product" );            # stringification helps to round up things like 0.1*10 (instead of leaving them at 0.99999999)
 
-        return ($slots_available<$slots_asked) ? $slots_available : $slots_asked;
+        my $hit_the_limit = $slots_available<$slots_asked;
+
+        return ($hit_the_limit ? $slots_available : $slots_asked , $hit_the_limit);
     }
 
-    return $slots_asked;
+    return ($slots_asked, 0);
 }
 
 

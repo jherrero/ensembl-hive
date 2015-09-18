@@ -1,9 +1,16 @@
-EnsEMBL Hive
-============
+eHive
+=====
 
-EnsEMBL Hive is a system for running computation pipelines on distributed computing resources - clusters, farms or grids.
+[![Build Status](https://travis-ci.org/Ensembl/ensembl-hive.svg?branch=master)](https://travis-ci.org/Ensembl/ensembl-hive)
+[![Coverage Status](https://coveralls.io/repos/Ensembl/ensembl-hive/badge.svg?branch=master&service=github)](https://coveralls.io/github/Ensembl/ensembl-hive?branch=master)
 
-The name "Hive" comes from the way pipelines are processed by a swarm of autonomous agents.
+[travis]: https://travis-ci.org/Ensembl/ensembl-hive
+[coveralls]: https://coveralls.io/r/Ensembl/ensembl-hive
+
+
+eHive is a system for running computation pipelines on distributed computing resources - clusters, farms or grids.
+
+The name comes from the way pipelines are processed by a swarm of autonomous agents.
 
 Blackboard, Jobs and Workers
 ----------------------------
@@ -28,7 +35,7 @@ However in some sense an Analysis also acts as a "container" for them.
 
 PipeConfig file defines Analyses and dependency rules of the pipeline
 ---------------------------------------------------------------------
-Hive pipeline databases are molded according to PipeConfig files which are Perl modules conforming to a special interface.
+eHive pipeline databases are molded according to PipeConfig files which are Perl modules conforming to a special interface.
 A PipeConfig file defines the stucture of the pipeline, which is a graph whose nodes are Analyses
 (with their code, parameters and resource requirements) and edges are various dependency rules:
 * Dataflow rules define how data that flows out of an Analysis can be used to trigger creation of Jobs in other Analyses
@@ -44,13 +51,21 @@ There are also other parameters of Analyses that control, for example:
 * what should be autimatically done with a Job if it needs more memory/time,
 etc.
 
+Available documentation
+-----------------------
+The main entry point is in [**docs/index.html**](https://rawgit.com/Ensembl/ensembl-hive/HEAD/docs/index.html) and can also be browsed offline.
+
+There is preliminary support for Python3, see [the Doxygen
+documentation](https://rawgit.com/Ensembl/ensembl-hive/HEAD/wrappers/python3/doxygen/index.html) and
+[an example PipeConfig
+file](modules/Bio/EnsEMBL/Hive/PipeConfig/LongMultSt_pyconf.pm#L139).
+
 Contact us (mailing list)
 -------------------------
-EnsEMBL Hive was originally conceived and used within EnsEMBL Compara group
+eHive was originally conceived and used within EnsEMBL Compara group
 for running Comparative Genomics pipelines, but since then it has been separated
 into a separate software tool and is used in many projects both in Genome Campus, Cambridge and outside.
-There is a Hive users' mailing list for questions, suggestions, discussions and announcements.
+There is eHive users' mailing list for questions, suggestions, discussions and announcements.
 
-To subscribe to it please visit:
-        http://listserver.ebi.ac.uk/mailman/listinfo/ehive-users
+To subscribe to it please visit (http://listserver.ebi.ac.uk/mailman/listinfo/ehive-users)
 

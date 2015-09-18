@@ -10,7 +10,7 @@
 
 =head1 LICENSE
 
-    Copyright [1999-2014] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
+    Copyright [1999-2015] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
 
     Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
     You may obtain a copy of the License at
@@ -31,6 +31,7 @@
 package Bio::EnsEMBL::Hive::Meadow::LSF;
 
 use strict;
+use warnings;
 use Time::Piece;
 use Time::Seconds;
 
@@ -72,7 +73,8 @@ sub count_pending_workers_by_rc_name {
     my ($self) = @_;
 
     my $jnp = $self->job_name_prefix();
-    my $cmd = "bjobs -w -J '${jnp}*' -u all 2>/dev/null | grep PEND";
+    my $cmd = "bjobs -w -J '${jnp}*' 2>/dev/null | grep PEND";  # "-u all" has been removed to ensure one user's PEND processes
+                                                                #   do not affect another user helping to run the same pipeline.
 
 #    warn "LSF::count_pending_workers_by_rc_name() running cmd:\n\t$cmd\n";
 
@@ -91,41 +93,54 @@ sub count_pending_workers_by_rc_name {
 
 
 sub count_running_workers {
-    my ($self) = @_;
+    my $self                        = shift @_;
+    my $meadow_users_of_interest    = shift @_ || [ 'all' ];
 
     my $jnp = $self->job_name_prefix();
-    my $cmd = "bjobs -w -J '${jnp}*' -u all 2>/dev/null | grep RUN | wc -l";
 
-#    warn "LSF::count_running_workers() running cmd:\n\t$cmd\n";
+    my $total_running_worker_count = 0;
 
-    my $run_count = qx/$cmd/;
-    chomp($run_count);
+    foreach my $meadow_user (@$meadow_users_of_interest) {
+        my $cmd = "bjobs -w -J '${jnp}*' -u $meadow_user 2>/dev/null | grep RUN | wc -l";
 
-    return $run_count;
+#        warn "LSF::count_running_workers() running cmd:\n\t$cmd\n";
+
+        my $meadow_user_worker_count = qx/$cmd/;
+        chomp($meadow_user_worker_count);
+
+        $total_running_worker_count += $meadow_user_worker_count;
+    }
+
+    return $total_running_worker_count;
 }
 
 
 sub status_of_all_our_workers { # returns a hashref
-    my ($self) = @_;
+    my $self                        = shift @_;
+    my $meadow_users_of_interest    = shift @_ || [ 'all' ];
 
     my $jnp = $self->job_name_prefix();
-    my $cmd = "bjobs -w -J '${jnp}*' -u all 2>/dev/null";
-
-#    warn "LSF::status_of_all_our_workers() running cmd:\n\t$cmd\n";
 
     my %status_hash = ();
-    foreach my $line (`$cmd`) {
-        my ($group_pid, $user, $status, $queue, $submission_host, $running_host, $job_name) = split(/\s+/, $line);
 
-        next if(($group_pid eq 'JOBID') or ($status eq 'DONE') or ($status eq 'EXIT'));
+    foreach my $meadow_user (@$meadow_users_of_interest) {
+        my $cmd = "bjobs -w -J '${jnp}*' -u $meadow_user 2>/dev/null";
 
-        my $worker_pid = $group_pid;
-        if($job_name=~/(\[\d+\])/) {
-            $worker_pid .= $1;
+#        warn "LSF::status_of_all_our_workers() running cmd:\n\t$cmd\n";
+
+        foreach my $line (`$cmd`) {
+            my ($group_pid, $user, $status, $queue, $submission_host, $running_host, $job_name) = split(/\s+/, $line);
+
+            next if(($group_pid eq 'JOBID') or ($status eq 'DONE') or ($status eq 'EXIT'));
+
+            my $worker_pid = $group_pid;
+            if($job_name=~/(\[\d+\])/) {
+                $worker_pid .= $1;
+            }
+            $status_hash{$worker_pid} = $status;
         }
-            
-        $status_hash{$worker_pid} = $status;
     }
+
     return \%status_hash;
 }
 
@@ -145,9 +160,11 @@ sub check_worker_is_alive_and_mine {
 
 
 sub kill_worker {
-    my $worker = pop @_;
+    my ($self, $worker, $fast) = @_;
 
-    my $cmd = 'bkill '.$worker->process_id();
+    my $fast_flag = $fast ? '-r ' : '';
+
+    my $cmd = "bkill $fast_flag".$worker->process_id();
 
 #    warn "LSF::kill_worker() running cmd:\n\t$cmd\n";
 
@@ -177,9 +194,10 @@ sub parse_report_source_line {
     warn "LSF::parse_report_source_line( \"$bacct_source_line\" )\n";
 
     my %status_2_cod = (
-        'TERM_MEMLIMIT' => 'MEMLIMIT',
-        'TERM_RUNLIMIT' => 'RUNLIMIT',
-        'TERM_OWNER'    => 'KILLED_BY_USER',
+        'TERM_MEMLIMIT'     => 'MEMLIMIT',
+        'TERM_RUNLIMIT'     => 'RUNLIMIT',
+        'TERM_OWNER'        => 'KILLED_BY_USER',    # bkill     (wait until it dies)
+        'TERM_FORCE_OWNER'  => 'KILLED_BY_USER',    # bkill -r  (quick remove)
     );
 
     my %units_2_megs = (
@@ -204,21 +222,29 @@ sub parse_report_source_line {
         if( my ($process_id) = $lines[0]=~/^Job <(\d+(?:\[\d+\])?)>/) {
 
             my ($exit_status, $exception_status) = ('' x 2);
-            my ($died, $cause_of_death);
+            my ($when_died, $cause_of_death);
+            my (@keys, @values);
+            my $line_has_key_values = 0;
             foreach (@lines) {
                 if( /^(\w+\s+\w+\s+\d+\s+\d+:\d+:\d+):\s+Completed\s<(\w+)>(?:\.|;\s+(\w+))/ ) {
-                    $died           = _yearless_2_datetime($1);
-                    $cause_of_death = $status_2_cod{$3};
+                    $when_died      = _yearless_2_datetime($1);
+                    $cause_of_death = $3 && $status_2_cod{$3};
                     $exit_status = $2 . ($3 ? "/$3" : '');
                 }
                 elsif(/^\s*EXCEPTION STATUS:\s*(.*?)\s*$/) {
                     $exception_status = $1;
                     $exception_status =~s/\s+/;/g;
                 }
+                elsif(/^\s*CPU_T/) {
+                    @keys = split(/\s+/, ' '.$_);
+                    $line_has_key_values = 1;
+                }
+                elsif($line_has_key_values) {
+                    @values = split(/\s+/, ' '.$_);
+                    $line_has_key_values = 0;
+                }
             }
 
-            my (@keys)   = split(/\s+/, ' '.$lines[@lines-2]);
-            my (@values) = split(/\s+/, ' '.$lines[@lines-1]);
             my %usage;  @usage{@keys} = @values;
 
             #warn join(', ', map {sprintf('%s=%s', $_, $usage{$_})} (sort keys %usage)), "\n";
@@ -228,7 +254,7 @@ sub parse_report_source_line {
 
             $report_entry{ $process_id } = {
                     # entries for 'worker' table:
-                'died'              => $died,
+                'when_died'         => $when_died,
                 'cause_of_death'    => $cause_of_death,
 
                     # entries for 'worker_resource_usage' table:
@@ -287,19 +313,27 @@ sub get_report_entries_for_time_interval {
 
 
 sub submit_workers {
-    my ($self, $worker_cmd, $required_worker_count, $iteration, $rc_name, $rc_specific_submission_cmd_args, $submit_stdout_file, $submit_stderr_file) = @_;
+    my ($self, $worker_cmd, $required_worker_count, $iteration, $rc_name, $rc_specific_submission_cmd_args, $submit_log_subdir) = @_;
 
-    my $job_name                            = $self->generate_job_name($required_worker_count, $iteration, $rc_name);
+    my $job_array_common_name               = $self->job_array_common_name($rc_name, $iteration);
+    my $job_array_name_with_indices         = $job_array_common_name . (($required_worker_count > 1) ? "[1-${required_worker_count}]" : '');
     my $meadow_specific_submission_cmd_args = $self->config_get('SubmissionOptions');
 
-    $submit_stdout_file ||= '/dev/null';    # a value is required
-    $submit_stderr_file ||= '/dev/null';    # a value is required
+    my ($submit_stdout_file, $submit_stderr_file);
+
+    if($submit_log_subdir) {
+        $submit_stdout_file = $submit_log_subdir . "/log_${rc_name}_%J_%I.out";
+        $submit_stderr_file = $submit_log_subdir . "/log_${rc_name}_%J_%I.err";
+    } else {
+        $submit_stdout_file = '/dev/null';
+        $submit_stderr_file = '/dev/null';
+    }
 
     $ENV{'LSB_STDOUT_DIRECT'} = 'y';  # unbuffer the output of the bsub command
 
-    my $cmd = qq{bsub -o $submit_stdout_file -e $submit_stderr_file -J "${job_name}" $rc_specific_submission_cmd_args $meadow_specific_submission_cmd_args $worker_cmd};
+    my $cmd = qq{bsub -o $submit_stdout_file -e $submit_stderr_file -J "${job_array_name_with_indices}" $rc_specific_submission_cmd_args $meadow_specific_submission_cmd_args $worker_cmd};
 
-    warn "LSF::submit_workers() running cmd:\n\t$cmd\n";
+    print "Executing [ ".$self->signature." ] \t\t$cmd\n";
 
     system($cmd) && die "Could not submit job(s): $!, $?";  # let's abort the beekeeper and let the user check the syntax
 }

@@ -14,7 +14,7 @@
 
 =head1 LICENSE
 
-    Copyright [1999-2014] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
+    Copyright [1999-2015] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
 
     Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
     You may obtain a copy of the License at
@@ -35,8 +35,12 @@
 package Bio::EnsEMBL::Hive::DBSQL::DBAdaptor;
 
 use strict;
+use warnings;
+
+use Scalar::Util qw(weaken);
 
 use Bio::EnsEMBL::Hive;
+use Bio::EnsEMBL::Hive::HivePipeline;
 use Bio::EnsEMBL::Hive::DBSQL::DBConnection;
 use Bio::EnsEMBL::Hive::DBSQL::SqlSchemaAdaptor;
 use Bio::EnsEMBL::Hive::Utils ('throw');
@@ -48,6 +52,8 @@ use Bio::EnsEMBL::Hive::ResourceClass;
 use Bio::EnsEMBL::Hive::ResourceDescription;
 use Bio::EnsEMBL::Hive::Analysis;
 use Bio::EnsEMBL::Hive::AnalysisStats;
+use Bio::EnsEMBL::Hive::AnalysisCtrlRule;
+use Bio::EnsEMBL::Hive::DataflowRule;
 
 
 sub new {
@@ -55,9 +61,9 @@ sub new {
     my %flags = @_;
 
     my ($dbc, $url, $reg_conf, $reg_type, $reg_alias, $species, $no_sql_schema_version_check)
-        = @flags{qw(-dbconn -url -reg_conf -reg_type -reg_alias -species -no_sql_schema_version_check)};
+        = delete @flags{qw(-dbconn -url -reg_conf -reg_type -reg_alias -species -no_sql_schema_version_check)};
 
-    $url .= ';nosqlvc=1' if($url && $no_sql_schema_version_check);
+    $url .= ';no_sql_schema_version_check=1' if($url && $no_sql_schema_version_check);
 
     if($reg_conf or $reg_alias) {   # need to initialize Registry even if $reg_conf is not really given
         require Bio::EnsEMBL::Registry;
@@ -67,18 +73,32 @@ sub new {
     my $self;
 
     if($url) {
-
-        $dbc = Bio::EnsEMBL::Hive::DBSQL::DBConnection->new(-url => $url)
+        $dbc = Bio::EnsEMBL::Hive::DBSQL::DBConnection->new(-url => $url, %flags)
             or die "Unable to create a DBC using url='$url'";
 
     } elsif($reg_alias) {
 
-        $reg_type ||= 'hive';
+        if($reg_alias=~/^(\w+):(\w+)$/) {
+            ($reg_type, $reg_alias) = ($1, $2);
+        }
 
-        $self = Bio::EnsEMBL::Registry->get_DBAdaptor($reg_alias, $reg_type)
-            or die "Unable to connect to DBA using reg_conf='$reg_conf', reg_type='$reg_type', reg_alias='$reg_alias'\n";
+        unless($reg_type) {     # if no $reg_type explicitly given, try to guess:
+            my $dbas = Bio::EnsEMBL::Registry->get_all_DBAdaptors(-species => $reg_alias);
 
-        if($reg_type ne 'hive') {   # ensure we are getting a Hive adaptor even from a non-Hive Registry entry:
+            if( scalar(@$dbas) == 1 ) {
+                $self = $dbas->[0];
+            } elsif( @$dbas ) {
+                warn "The registry contains multiple entries for '$reg_alias', please prepend the reg_alias with the desired type";
+            }
+        }
+
+        unless($self) {         # otherwise (or if not found) try a specific $reg_type
+            $reg_type ||= 'hive';
+            $self = Bio::EnsEMBL::Registry->get_DBAdaptor($reg_alias, $reg_type)
+                or die "Unable to connect to DBA using reg_conf='$reg_conf', reg_type='$reg_type', reg_alias='$reg_alias'\n";
+        }
+
+        if( $self and !$self->isa($class) ) {   # if we found a non-Hive Registry entry, detach the $dbc and build a Hive dba around it:
             $dbc = $self->dbc;
             $self = undef;
         }
@@ -92,40 +112,43 @@ sub new {
     unless($no_sql_schema_version_check) {
 
         my $dbc = $self->dbc();
-        $url ||= $dbc->url();
+        my $safe_url = $dbc->url('EHIVE_PASS');
 
         my $code_sql_schema_version = Bio::EnsEMBL::Hive::DBSQL::SqlSchemaAdaptor->get_code_sql_schema_version()
-            || die "DB($url) Could not establish code_sql_schema_version, please check that 'EHIVE_ROOT_DIR' environment variable is set correctly";
+            || die "DB($safe_url) Could not establish code_sql_schema_version, please check that 'EHIVE_ROOT_DIR' environment variable is set correctly";
 
-        my $db_sql_schema_version   = eval { $self->get_MetaAdaptor->get_value_by_key( 'hive_sql_schema_version' ); };
+        my $db_sql_schema_version   = eval { $self->get_MetaAdaptor->fetch_by_meta_key( 'hive_sql_schema_version' )->{'meta_value'}; };
+
         if($@) {
             if($@ =~ /hive_meta.*doesn't exist/) {
 
-                die "\nDB($url) The 'hive_meta' table does not seem to exist in the database yet.\nPlease patch the database up to sql_schema_version '$code_sql_schema_version' and try again.\n";
+                die "\nDB($safe_url) The 'hive_meta' table does not seem to exist in the database yet.\nPlease patch the database up to sql_schema_version '$code_sql_schema_version' and try again.\n";
 
             } else {
 
-                die "DB($url) $@";
+                die "DB($safe_url) $@";
             }
 
         } elsif(!$db_sql_schema_version) {
 
-            die "\nDB($url) The 'hive_meta' table does not contain 'hive_sql_schema_version' entry.\nPlease investigate.\n";
+            die "\nDB($safe_url) The 'hive_meta' table does not contain 'hive_sql_schema_version' entry.\nPlease investigate.\n";
 
         } elsif($db_sql_schema_version < $code_sql_schema_version) {
 
             my $new_patches = Bio::EnsEMBL::Hive::DBSQL::SqlSchemaAdaptor->get_sql_schema_patches( $db_sql_schema_version, $dbc->driver )
-                || die "DB($url) sql_schema_version mismatch: the database's version is '$db_sql_schema_version' but the code is already '$code_sql_schema_version'.\n"
+                || die "DB($safe_url) sql_schema_version mismatch: the database's version is '$db_sql_schema_version' but the code is already '$code_sql_schema_version'.\n"
                       ."Unfortunately we cannot patch the database; you may have to create a new database or agree to run older code\n";
 
-            my $patcher_command = "$ENV{'EHIVE_ROOT_DIR'}/scripts/db_cmd.pl -url $url";
+            my $sql_patcher_command = "$ENV{'EHIVE_ROOT_DIR'}/scripts/db_cmd.pl -url $safe_url";
 
-            die "DB($url) sql_schema_version mismatch: the database's version is '$db_sql_schema_version' but the code is already '$code_sql_schema_version'.\n"
-               ."Please upgrade the database by applying the following patches:\n\n".join("\n", map { "\t$patcher_command < $_" } @$new_patches)."\n\nand try again.\n";
+            die "DB($safe_url) sql_schema_version mismatch: the database's version is '$db_sql_schema_version' but the code is already '$code_sql_schema_version'.\n"
+               ."Please upgrade the database by applying the following patches:\n\n"
+               .join("\n", map { ($_=~/\.\w*sql\w*$/) ? "\t$sql_patcher_command < $_" : "$_ -url $safe_url" } @$new_patches)
+               ."\n\nand try again.\n";
 
         } elsif($code_sql_schema_version < $db_sql_schema_version) {
 
-            die "DB($url) sql_schema_version mismatch: the database's version is '$db_sql_schema_version', but your code is still '$code_sql_schema_version'.\n"
+            die "DB($safe_url) sql_schema_version mismatch: the database's version is '$db_sql_schema_version', but your code is still '$code_sql_schema_version'.\n"
                ."Please update the code and try again.\n";
         }
     }
@@ -139,6 +162,11 @@ sub new {
 }
 
 
+sub species {   # a stub to please Registry code
+    return @_;
+}
+
+
 sub dbc {
     my $self = shift;
 
@@ -148,25 +176,40 @@ sub dbc {
 }
 
 
-sub hive_use_triggers {  # getter only, not setter
+sub hive_pipeline {
     my $self = shift @_;
-
-    unless( defined($self->{'_hive_use_triggers'}) ) {
-        my $hive_use_triggers = $self->get_MetaAdaptor->get_value_by_key( 'hive_use_triggers' );
-        $self->{'_hive_use_triggers'} = $hive_use_triggers || 0;
-    } 
-    return $self->{'_hive_use_triggers'};
+    if (@_) {
+        $self->{'_hive_pipeline'} = shift @_;
+    }
+    unless ($self->{'_hive_pipeline'}) {
+        $self->{'_hive_pipeline'} = Bio::EnsEMBL::Hive::HivePipeline->new( -dba => $self );
+    }
+    return $self->{'_hive_pipeline'};
 }
 
 
-sub hive_use_param_stack {  # getter only, not setter
+sub hive_use_triggers {  # getter only, not setter
     my $self = shift @_;
 
-    unless( defined($self->{'_hive_use_param_stack'}) ) {
-        my $hive_use_param_stack = $self->get_MetaAdaptor->get_value_by_key( 'hive_use_param_stack' );
-        $self->{'_hive_use_param_stack'} = $hive_use_param_stack || 0;
-    } 
-    return $self->{'_hive_use_param_stack'};
+    return $self->hive_pipeline->get_meta_value_by_key('hive_use_triggers') // 0;
+}
+
+sub hive_auto_rebalance_semaphores {  # getter only, not setter
+    my $self = shift @_;
+
+    return $self->hive_pipeline->get_meta_value_by_key('hive_auto_rebalance_semaphores') // 0;
+}
+
+sub list_all_hive_tables {
+    my $self = shift @_;
+
+    return [ split /,/, ($self->hive_pipeline->get_meta_value_by_key('hive_all_base_tables') // '') ];
+}
+
+sub list_all_hive_views {
+    my $self = shift @_;
+
+    return [ split /,/, ($self->hive_pipeline->get_meta_value_by_key('hive_all_views') // '') ];
 }
 
 
@@ -184,6 +227,7 @@ our %adaptor_type_2_package_name = (
     'NakedTable'            => 'Bio::EnsEMBL::Hive::DBSQL::NakedTableAdaptor',
     'ResourceClass'         => 'Bio::EnsEMBL::Hive::DBSQL::ResourceClassAdaptor',
     'ResourceDescription'   => 'Bio::EnsEMBL::Hive::DBSQL::ResourceDescriptionAdaptor',
+    'Role'                  => 'Bio::EnsEMBL::Hive::DBSQL::RoleAdaptor',
     'Queen'                 => 'Bio::EnsEMBL::Hive::Queen',
 
         # aliases:
@@ -255,7 +299,7 @@ sub AUTOLOAD {
     } elsif ( $AUTOLOAD =~ /^.*::get_(\w+)$/ ) {
         $type = $1;
     } else {
-        die "DBAdaptor::AUTOLOAD: Could not interpret the method: $AUTOLOAD";
+        throw( "DBAdaptor::AUTOLOAD: Could not interpret the method: $AUTOLOAD" );
     }
 
     my $self = shift;
@@ -264,48 +308,4 @@ sub AUTOLOAD {
 }
 
 
-sub init_collections {  # should not really belong to DBAdaptor, temporarily squatting here...
-
-    foreach my $AdaptorType ('MetaParameters', 'PipelineWideParameters', 'ResourceClass', 'ResourceDescription', 'Analysis', 'AnalysisStats', 'AnalysisCtrlRule', 'DataflowRule') {
-        my $class = 'Bio::EnsEMBL::Hive::'.$AdaptorType;
-        $class->collection( Bio::EnsEMBL::Hive::Utils::Collection->new() );
-    }
-}
-
-
-sub load_collections {
-    my $self = shift @_;
-
-    foreach my $AdaptorType ('MetaParameters', 'PipelineWideParameters', 'ResourceClass', 'ResourceDescription', 'Analysis', 'AnalysisStats', 'AnalysisCtrlRule', 'DataflowRule') {
-        my $adaptor = $self->get_adaptor( $AdaptorType );
-        my $class = 'Bio::EnsEMBL::Hive::'.$AdaptorType;
-        $class->collection( Bio::EnsEMBL::Hive::Utils::Collection->new( $adaptor->fetch_all ) );
-    }
-}
-
-
-sub save_collections {
-    my $self = shift @_;
-
-    foreach my $AdaptorType ('MetaParameters', 'PipelineWideParameters', 'ResourceClass', 'ResourceDescription', 'Analysis', 'AnalysisStats', 'AnalysisCtrlRule', 'DataflowRule') {
-        my $adaptor = $self->get_adaptor( $AdaptorType );
-        my $class = 'Bio::EnsEMBL::Hive::'.$AdaptorType;
-        foreach my $storable_object ( $class->collection()->list ) {
-            $adaptor->store_or_update_one( $storable_object, $class->unikey() );
-#            warn "Stored/updated ".$storable_object->toString()."\n";
-        }
-    }
-
-    my $job_adaptor = $self->get_AnalysisJobAdaptor;
-    foreach my $analysis ( Bio::EnsEMBL::Hive::Analysis->collection()->list ) {
-        if(my $our_jobs = $analysis->jobs_collection ) {
-            $job_adaptor->store( $our_jobs );
-            foreach my $job (@$our_jobs) {
-#                warn "Stored ".$job->toString()."\n";
-            }
-        }
-    }
-}
-
 1;
-

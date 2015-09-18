@@ -37,7 +37,7 @@
 
 =head1 LICENSE
 
-    Copyright [1999-2014] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
+    Copyright [1999-2015] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
 
     Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
     You may obtain a copy of the License at
@@ -61,9 +61,9 @@ use strict;
 use warnings;
 
 use Bio::EnsEMBL::Hive;
+use Bio::EnsEMBL::Hive::Utils ('stringify', 'join_command_args');
 use Bio::EnsEMBL::Hive::Utils::Collection;
 use Bio::EnsEMBL::Hive::Utils::URL;
-use Bio::EnsEMBL::Hive::DBSQL::DBAdaptor;
 use Bio::EnsEMBL::Hive::DBSQL::SqlSchemaAdaptor;
 use Bio::EnsEMBL::Hive::DBSQL::AnalysisJobAdaptor;
 use Bio::EnsEMBL::Hive::Analysis;
@@ -103,10 +103,11 @@ sub default_options {
         'dbowner'               => $ENV{'EHIVE_USER'} || $ENV{'USER'} || $self->o('dbowner'),   # although it is very unlikely $ENV{USER} is not set
         'pipeline_name'         => $self->pipeline_name(),
 
-        'hive_use_triggers'     => 0,                   # there have been a few cases of big pipelines misbehaving with triggers on, let's keep the default off.
-        'hive_use_param_stack'  => 0,                   # do not reconstruct the calling stack of parameters by default (yet)
-        'hive_force_init'       => 0,                   # setting it to 1 will drop the database prior to creation (use with care!)
-        'hive_no_init'          => 0,                   # setting it to 1 will skip pipeline_create_commands (useful for topping up)
+        'hive_use_triggers'                 => 0,       # there have been a few cases of big pipelines misbehaving with triggers on, let's keep the default off.
+        'hive_use_param_stack'              => 0,       # do not reconstruct the calling stack of parameters by default (yet)
+        'hive_auto_rebalance_semaphores'    => 0,       # do not attempt to rebalance semaphores periodically by default
+        'hive_force_init'                   => 0,       # setting it to 1 will drop the database prior to creation (use with care!)
+        'hive_no_init'                      => 0,       # setting it to 1 will skip pipeline_create_commands (useful for topping up)
 
         'pipeline_db'   => {
             -driver => $self->o('hive_driver'),
@@ -135,6 +136,9 @@ sub pipeline_create_commands {
     my $driver          = $parsed_url ? $parsed_url->{'driver'} : '';
     my $hive_force_init = $self->o('hive_force_init');
 
+    # Will insert two keys: "hive_all_base_tables" and "hive_all_views"
+    my $hive_tables_sql = 'INSERT INTO hive_meta SELECT CONCAT("hive_all_", REPLACE(LOWER(TABLE_TYPE), " ", "_"), "s"), GROUP_CONCAT(TABLE_NAME) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = "%s" GROUP BY TABLE_TYPE';
+
     return [
             $hive_force_init ? $self->db_cmd('DROP DATABASE IF EXISTS') : (),
             $self->db_cmd('CREATE DATABASE'),
@@ -150,6 +154,8 @@ sub pipeline_create_commands {
 
                 # we got procedure definitions for all drivers:
             $self->db_cmd().' <'.$self->o('hive_root_dir').'/sql/procedures.'.$driver,
+
+            ($driver eq 'mysql' ? ($self->db_cmd(sprintf($hive_tables_sql, $parsed_url->{'dbname'}))) : ()),
     ];
 }
 
@@ -225,9 +231,10 @@ sub hive_meta_table {
     my ($self) = @_;
 
     return {
-        'hive_sql_schema_version'   => Bio::EnsEMBL::Hive::DBSQL::SqlSchemaAdaptor->get_code_sql_schema_version(),
-        'hive_pipeline_name'        => $self->o('pipeline_name'),
-        'hive_use_param_stack'      => $self->o('hive_use_param_stack'),
+        'hive_sql_schema_version'           => Bio::EnsEMBL::Hive::DBSQL::SqlSchemaAdaptor->get_code_sql_schema_version(),
+        'hive_pipeline_name'                => $self->o('pipeline_name'),
+        'hive_use_param_stack'              => $self->o('hive_use_param_stack'),
+        'hive_auto_rebalance_semaphores'    => $self->o('hive_auto_rebalance_semaphores'),
     };
 }
 
@@ -238,95 +245,6 @@ sub pre_options {
         'help!' => '',
         'pipeline_url' => '',
     };
-}
-
-
-=head2 dbconn_2_mysql
-
-    Description : Deprecated method. Please use $self->db_cmd() instead.
-
-=cut
-
-sub dbconn_2_mysql {    # will save you a lot of typing
-    my ($self, $db_conn, $with_db) = @_;
-
-    warn "\nDEPRECATED: dbconn_2_mysql() method is no longer supported, please call db_cmd(\$sql_command) instead, it will be more portable\n\n";
-
-    my $port = $self->o($db_conn,'-port');
-
-    return '--host='.$self->o($db_conn,'-host').' '
-          .($port ? '--port='.$self->o($db_conn,'-port').' ' : '')
-          .'--user="'.$self->o($db_conn,'-user').'" '
-          .'--password="'.$self->o($db_conn,'-pass').'" '
-          .($with_db ? ($self->o($db_conn,'-dbname').' ') : '');
-}
-
-
-=head2 dbconn_2_pgsql
-
-    Description : Deprecated method. Please use $self->db_cmd() instead.
-
-=cut
-
-sub dbconn_2_pgsql {    # will save you a lot of typing
-    my ($self, $db_conn, $with_db) = @_;
-
-    warn "\nDEPRECATED: dbconn_2_pgsql() method is no longer supported, please call db_cmd(\$sql_command) instead, it will be more portable\n\n";
-
-    my $port = $self->o($db_conn,'-port');
-
-    return '--host='.$self->o($db_conn,'-host').' '
-          .($port ? '--port='.$self->o($db_conn,'-port').' ' : '')
-          .'--username="'.$self->o($db_conn,'-user').'" '
-          .($with_db ? ($self->o($db_conn,'-dbname').' ') : '');
-}
-
-=head2 db_connect_command
-
-    Description : Deprecated method. Please use $self->db_cmd() instead.
-
-=cut
-
-sub db_connect_command {
-    my ($self, $db_conn) = @_;
-
-    warn "\nDEPRECATED: db_connect_command() method is no longer supported, please call db_cmd(\$sql_command) instead, it will be more portable\n\n";
-
-    my $driver = $self->o($db_conn, '-driver');
-
-    return {
-        'sqlite'    => 'sqlite3 '.$self->o($db_conn, '-dbname'),
-        'mysql'     => 'mysql '.$self->dbconn_2_mysql($db_conn, 1),
-        'pgsql'     => "env PGPASSWORD='".$self->o($db_conn,'-pass')."' psql ".$self->dbconn_2_pgsql($db_conn, 1),
-    }->{ $driver };
-}
-
-
-=head2 db_execute_command
-
-    Description : Deprecated method. Please use $self->db_cmd() instead.
-
-=cut
-
-sub db_execute_command {
-    my ($self, $db_conn, $sql_command, $with_db) = @_;
-
-    warn "\nDEPRECATED: db_execute_command() method is no longer supported, please call db_cmd(\$sql_command) instead, it will be more portable\n\n";
-
-    $with_db = 1 unless(defined($with_db));
-
-    my $driver = $self->o($db_conn, '-driver');
-
-    if(($driver eq 'sqlite') && !$with_db) {    # in these special cases we pretend sqlite can understand these commands
-        return "rm -f $1" if($sql_command=~/DROP\s+DATABASE\s+(?:IF\s+EXISTS\s+)?(\w+)/);
-        return "touch $1" if($sql_command=~/CREATE\s+DATABASE\s+(\w+)/);
-    } else {
-        return {
-            'sqlite'    => 'sqlite3 '.$self->o($db_conn, '-dbname')." '$sql_command'",
-            'mysql'     => 'mysql '.$self->dbconn_2_mysql($db_conn, $with_db)." -e '$sql_command'",
-            'pgsql'     => "env PGPASSWORD='".$self->o($db_conn,'-pass')."' psql --command='$sql_command' ".$self->dbconn_2_pgsql($db_conn, $with_db),
-        }->{ $driver };
-    }
 }
 
 
@@ -429,10 +347,20 @@ sub overridable_pipeline_create_commands {
 }
 
 
+sub is_analysis_topup {
+    my $self                        = shift @_;
+
+    return $self->o('hive_no_init');
+}
+
+
 sub run_pipeline_create_commands {
     my $self            = shift @_;
 
     foreach my $cmd (@{$self->overridable_pipeline_create_commands}) {
+        # We allow commands to be given as an arrayref, but we join the
+        # array elements anyway
+        (my $dummy,$cmd) = join_command_args($cmd);
         warn "Running the command:\n\t$cmd\n";
         if(my $retval = system($cmd)) {
             die "Return value = $retval, possibly an error\n";
@@ -452,12 +380,13 @@ sub run_pipeline_create_commands {
 =cut
 
 sub add_objects_from_config {
-    my $self                = shift @_;
+    my $self        = shift @_;
+    my $pipeline    = shift @_;
 
     warn "Adding hive_meta table entries ...\n";
     my $new_meta_entries = $self->hive_meta_table();
     while( my ($meta_key, $meta_value) = each %$new_meta_entries ) {
-        Bio::EnsEMBL::Hive::MetaParameters->add_new_or_update(
+        $pipeline->add_new_or_update( 'MetaParameters',
             'meta_key'      => $meta_key,
             'meta_value'    => $meta_value,
         );
@@ -467,9 +396,9 @@ sub add_objects_from_config {
     warn "Adding pipeline-wide parameters ...\n";
     my $new_pwp_entries = $self->pipeline_wide_parameters();
     while( my ($param_name, $param_value) = each %$new_pwp_entries ) {
-        Bio::EnsEMBL::Hive::PipelineWideParameters->add_new_or_update(
+        $pipeline->add_new_or_update( 'PipelineWideParameters',
             'param_name'    => $param_name,
-            'param_value'   => $param_value,
+            'param_value'   => stringify($param_value),
         );
     }
     warn "Done.\n\n";
@@ -486,14 +415,14 @@ sub add_objects_from_config {
             die "-rc_id syntax is no longer supported, please use the new resource notation (-rc_name)";
         }
 
-        my $resource_class = Bio::EnsEMBL::Hive::ResourceClass->add_new_or_update(
+        my $resource_class = $pipeline->add_new_or_update( 'ResourceClass',
             'name'  => $rc_name,
         );
 
         while( my($meadow_type, $resource_param_list) = each %{ $resource_classes_hash->{$rc_name} } ) {
             $resource_param_list = [ $resource_param_list ] unless(ref($resource_param_list));  # expecting either a scalar or a 2-element array
 
-            my $resource_description = Bio::EnsEMBL::Hive::ResourceDescription->add_new_or_update(
+            my $resource_description = $pipeline->add_new_or_update( 'ResourceDescription',
                 'resource_class'        => $resource_class,
                 'meadow_type'           => $meadow_type,
                 'submission_cmd_args'   => $resource_param_list->[0],
@@ -512,12 +441,14 @@ sub add_objects_from_config {
     warn "Adding Analyses ...\n";
     foreach my $aha (@{$self->pipeline_analyses}) {
         my ($logic_name, $module, $parameters_hash, $input_ids, $blocked, $batch_size, $hive_capacity, $failed_job_tolerance,
-                $max_retry_count, $can_be_empty, $rc_id, $rc_name, $priority, $meadow_type, $analysis_capacity)
+                $max_retry_count, $can_be_empty, $rc_id, $rc_name, $priority, $meadow_type, $analysis_capacity, $language)
          = @{$aha}{qw(-logic_name -module -parameters -input_ids -blocked -batch_size -hive_capacity -failed_job_tolerance
-                 -max_retry_count -can_be_empty -rc_id -rc_name -priority -meadow_type -analysis_capacity)};   # slicing a hash reference
+                 -max_retry_count -can_be_empty -rc_id -rc_name -priority -meadow_type -analysis_capacity -language)};   # slicing a hash reference
 
-        unless($logic_name) {
+        if( not $logic_name ) {
             die "logic_name' must be defined in every analysis";
+        } elsif( $logic_name =~ /[+\-\%\.,]/ ) {
+            die "Characters + - % . , are no longer allowed to be a part of an Analysis name. Please rename Analysis '$logic_name' and try again.\n";
         }
 
         if($seen_logic_name{$logic_name}++) {
@@ -528,7 +459,7 @@ sub add_objects_from_config {
             die "(-rc_id => $rc_id) syntax is deprecated, please use (-rc_name => 'your_resource_class_name')";
         }
 
-        my $analysis = Bio::EnsEMBL::Hive::Analysis->collection()->find_one_by('logic_name', $logic_name);  # the analysis with this logic_name may have already been stored in the db
+        my $analysis = $pipeline->collection_of('Analysis')->find_one_by('logic_name', $logic_name);  # the analysis with this logic_name may have already been stored in the db
         my $stats;
         if( $analysis ) {
 
@@ -538,7 +469,7 @@ sub add_objects_from_config {
         } else {
 
             $rc_name ||= 'default';
-            my $resource_class = Bio::EnsEMBL::Hive::ResourceClass->collection()->find_one_by('name', $rc_name)
+            my $resource_class = $pipeline->collection_of('ResourceClass')->find_one_by('name', $rc_name)
                 or die "Could not find local resource with name '$rc_name', please check that resource_classes() method of your PipeConfig either contains or inherits it from the parent class";
 
             if ($meadow_type and not exists $valley->available_meadow_hash()->{$meadow_type}) {
@@ -548,9 +479,10 @@ sub add_objects_from_config {
             $parameters_hash ||= {};    # in case nothing was given
             die "'-parameters' has to be a hash" unless(ref($parameters_hash) eq 'HASH');
 
-            $analysis = Bio::EnsEMBL::Hive::Analysis->add_new_or_update(
+            $analysis = $pipeline->add_new_or_update( 'Analysis',
                 'logic_name'            => $logic_name,
                 'module'                => $module,
+                'language'              => $language,
                 'parameters'            => $parameters_hash,
                 'resource_class'        => $resource_class,
                 'failed_job_tolerance'  => $failed_job_tolerance,
@@ -562,7 +494,7 @@ sub add_objects_from_config {
             );
             $analysis->get_compiled_module_name();  # check if it compiles and is named correctly
 
-            $stats = Bio::EnsEMBL::Hive::AnalysisStats->add_new_or_update(
+            $stats = $pipeline->add_new_or_update( 'AnalysisStats',
                 'analysis'              => $analysis,
                 'batch_size'            => $batch_size,
                 'hive_capacity'         => $hive_capacity,
@@ -573,7 +505,6 @@ sub add_objects_from_config {
                 'done_job_count'        => 0,
                 'failed_job_count'      => 0,
                 'num_running_workers'   => 0,
-                'num_required_workers'  => 0,
                 'behaviour'             => 'STATIC',
                 'input_capacity'        => 4,
                 'output_capacity'       => 4,
@@ -599,7 +530,7 @@ sub add_objects_from_config {
         my ($logic_name, $wait_for, $flow_into)
              = @{$aha}{qw(-logic_name -wait_for -flow_into)};   # slicing a hash reference
 
-        my $analysis = Bio::EnsEMBL::Hive::Analysis->collection()->find_one_by('logic_name', $logic_name);
+        my $analysis = $pipeline->collection_of('Analysis')->find_one_by('logic_name', $logic_name);
 
         $wait_for ||= [];
         $wait_for   = [ $wait_for ] unless(ref($wait_for) eq 'ARRAY'); # force scalar into an arrayref
@@ -607,10 +538,10 @@ sub add_objects_from_config {
             # create control rules:
         foreach my $condition_url (@$wait_for) {
             unless ($condition_url =~ m{^\w*://}) {
-                my $condition_analysis = Bio::EnsEMBL::Hive::Analysis->collection()->find_one_by('logic_name', $condition_url)
+                my $condition_analysis = $pipeline->collection_of('Analysis')->find_one_by('logic_name', $condition_url)
                     or die "Could not find a local analysis '$condition_url' to create a control rule (in '".($analysis->logic_name)."')\n";
             }
-            my $c_rule = Bio::EnsEMBL::Hive::AnalysisCtrlRule->add_new_or_update(
+            my $c_rule = $pipeline->add_new_or_update( 'AnalysisCtrlRule',
                     'condition_analysis_url'    => $condition_url,
                     'ctrled_analysis'           => $analysis,
             );
@@ -655,7 +586,7 @@ sub add_objects_from_config {
             while(my ($heir_url, $input_id_template_list) = each %$heirs) {
 
                 unless ($heir_url =~ m{^\w*://}) {
-                    my $heir_analysis = Bio::EnsEMBL::Hive::Analysis->collection()->find_one_by('logic_name', $heir_url)
+                    my $heir_analysis = $pipeline->collection_of('Analysis')->find_one_by('logic_name', $heir_url)
                         or die "Could not find a local analysis named '$heir_url' (dataflow from analysis '".($analysis->logic_name)."')\n";
                 }
 
@@ -663,7 +594,7 @@ sub add_objects_from_config {
 
                 foreach my $input_id_template (@$input_id_template_list) {
 
-                    my $df_rule = Bio::EnsEMBL::Hive::DataflowRule->add_new_or_update(
+                    my $df_rule = $pipeline->add_new_or_update( 'DataflowRule',
                         'from_analysis'             => $analysis,
                         'to_analysis_url'           => $heir_url,
                         'branch_code'               => $branch_name_or_code,
@@ -718,10 +649,10 @@ sub useful_commands_legend {
         " # At any moment during or after execution you can request a pipeline diagram in an image file (desired format is set via extension) :",
         "\tgenerate_graph.pl -url $pipeline_url -out $pipeline_name.png",
         '',
-        " # If you are running the pipeline on LSF, you can collect actual resource usage statistics :",
-        "\tlsf_report.pl -url $pipeline_url",
+        " # Depending on the Meadow the pipeline is running on, you may be able to collect actual resource usage statistics :",
+        "\tload_resource_usage.pl -url $pipeline_url",
         '',
-        " # After having run lsf_report.pl, you can request a resource usage timeline in an image file (desired format is set via extension) :",
+        " # After having run load_resource_usage.pl, you can request a resource usage timeline in an image file (desired format is set via extension) :",
         "\tgenerate_timeline.pl -url $pipeline_url -out timeline_$pipeline_name.png",
         '',
         " # Peek into your pipeline database with a database client (useful to have open while the pipeline is running) :",

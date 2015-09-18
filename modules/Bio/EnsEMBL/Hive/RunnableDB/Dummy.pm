@@ -25,7 +25,7 @@
 
 =head1 LICENSE
 
-    Copyright [1999-2014] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
+    Copyright [1999-2015] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
 
     Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
     You may obtain a copy of the License at
@@ -51,10 +51,6 @@ use Time::HiRes ('usleep');
 
 use base ('Bio::EnsEMBL::Hive::Process');
 
-
-sub strict_hash_format { # allow this Runnable to parse parameters in its own way (don't complain)
-    return 0;
-}
 
 =head2 param_defaults
 

@@ -6,8 +6,8 @@
 
 =head1 SYNOPSIS
 
-    $naked_table_adaptor = $dba->get_NakedTableAdaptor;
-    $naked_table_adaptor = $naked_table->adaptor;
+    my $intermediate_result_nt_adaptor  = $dba->get_NakedTableAdaptor( 'table_name' => 'intermediate_result' );
+    my $final_result_nt_adaptor         = $final_result_nt->adaptor;
 
 =head1 DESCRIPTION
 
@@ -16,7 +16,7 @@
 
 =head1 LICENSE
 
-    Copyright [1999-2014] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
+    Copyright [1999-2015] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
 
     Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
     You may obtain a copy of the License at
@@ -37,15 +37,15 @@
 package Bio::EnsEMBL::Hive::DBSQL::NakedTableAdaptor;
 
 use strict;
-use Bio::EnsEMBL::Hive::NakedTable;
+use warnings;
 
 use base ('Bio::EnsEMBL::Hive::DBSQL::BaseAdaptor');
 
 
 sub slicer {    # take a slice of the hashref (if only we could inline in Perl!)
-    my ($self, $object, $fields) = @_;
+    my ($self, $hashref, $fields) = @_;
 
-    return [ @$object{@$fields} ];
+    return [ @$hashref{@$fields} ];
 }
 
 
@@ -64,9 +64,9 @@ sub mark_stored {
 
 
 sub keys_to_columns {
-    my ($self, $object) = @_;
+    my ($self, $hashref) = @_;
 
-    my $sorted_keys = [ sort keys %$object ];
+    my $sorted_keys = [ sort keys %$hashref ];
 
     return ( $sorted_keys, join(', ', @$sorted_keys) );
 }

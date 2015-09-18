@@ -31,7 +31,7 @@
 
 =head1 LICENSE
 
-    Copyright [1999-2014] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
+    Copyright [1999-2015] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
 
     Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
     You may obtain a copy of the License at
@@ -52,9 +52,10 @@
 package Bio::EnsEMBL::Hive::DataflowRule;
 
 use strict;
+use warnings;
 
 use Bio::EnsEMBL::Hive::Utils ('stringify', 'throw');
-use Bio::EnsEMBL::Hive::DBSQL::AnalysisAdaptor;
+use Bio::EnsEMBL::Hive::TheApiary;
 
 use base ( 'Bio::EnsEMBL::Hive::Cacheable', 'Bio::EnsEMBL::Hive::Storable' );
 
@@ -122,22 +123,12 @@ sub to_analysis_url {
     if(@_) {
         $self->{'_to_analysis_url'} = shift @_;
         if( $self->{'_to_analysis'} ) {
-#            warn "setting to_analysis_url() in an object that had to_analysis() defined";
             $self->{'_to_analysis'} = undef;
         }
-    } elsif( !$self->{'_to_analysis_url'} and my $analysis_or_nt=$self->{'_to_analysis'} ) {
+    } elsif( !$self->{'_to_analysis_url'} and my $target_object=$self->{'_to_analysis'} ) {
 
-        # if the 'from' and 'to' share the same adaptor, then use a simple logic_name
-        # for the URL rather than a full network distributed URL
-
-            # FIXME: the following block could be incapsulated in Analysis->url() and NakedTable->url()
-        my $ref_analysis_adaptor = $self->from_analysis && $self->from_analysis->adaptor;
-        if($analysis_or_nt->can('logic_name') and $ref_analysis_adaptor and ($ref_analysis_adaptor == $analysis_or_nt->adaptor)) {
-            $self->{'_to_analysis_url'} = $analysis_or_nt->logic_name;
-        } else {
-            $self->{'_to_analysis_url'} = $analysis_or_nt->url($ref_analysis_adaptor->db);
-        }
-#        warn "Lazy-loaded to_analysis_url\n";
+        my $ref_dba = $self->from_analysis && $self->from_analysis->adaptor && $self->from_analysis->adaptor->db;
+        $self->{'_to_analysis_url'} = $target_object->url( $ref_dba );      # the URL may be shorter if DBA is the same for source and target
     }
 
     return $self->{'_to_analysis_url'};
@@ -154,28 +145,18 @@ sub to_analysis_url {
 =cut
 
 sub to_analysis {
-    my ($self, $analysis_or_nt) = @_;
+    my ($self, $target_object) = @_;
 
-    if( defined $analysis_or_nt ) {
-        unless ($analysis_or_nt->can('url')) {
-            throw( "to_analysis arg must support 'url' method, '$analysis_or_nt' does not know how to do it");
+    if( defined $target_object ) {
+        unless ($target_object->can('url')) {
+            throw( "to_analysis arg must support 'url' method, '$target_object' does not know how to do it");
         }
-        $self->{'_to_analysis'} = $analysis_or_nt;
+        $self->{'_to_analysis'} = $target_object;
     }
 
-        # lazy load the analysis object if I can
-    if( !$self->{'_to_analysis'} and my $to_analysis_url = $self->to_analysis_url ) {
-        my $collection = Bio::EnsEMBL::Hive::Analysis->collection();
+    if( !$self->{'_to_analysis'} and my $to_analysis_url = $self->to_analysis_url ) {   # lazy-load through TheApiary
 
-        if( $collection and $self->{'_to_analysis'} = $collection->find_one_by('logic_name', $to_analysis_url) ) {
-#            warn "Lazy-loading object from 'Analysis' collection\n";
-        } elsif(my $adaptor = $self->adaptor) {
-#            warn "Lazy-loading object from AnalysisAdaptor\n";
-            $self->{'_to_analysis'} = $adaptor->db->get_AnalysisAdaptor->fetch_by_logic_name_or_url($to_analysis_url);
-        } else {
-#            warn "Lazy-loading object from full URL\n";
-            $self->{'_to_analysis'} = Bio::EnsEMBL::Hive::DBSQL::AnalysisAdaptor->fetch_by_logic_name_or_url($to_analysis_url);
-        }
+        $self->{'_to_analysis'} = Bio::EnsEMBL::Hive::TheApiary->find_by_url( $to_analysis_url, $self->hive_pipeline );
     }
 
     return $self->{'_to_analysis'};

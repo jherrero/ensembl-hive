@@ -15,7 +15,7 @@
 
 =head1 LICENSE
 
-    Copyright [1999-2014] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
+    Copyright [1999-2015] Wellcome Trust Sanger Institute and the EMBL-European Bioinformatics Institute
 
     Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License.
     You may obtain a copy of the License at
@@ -36,10 +36,12 @@
 package Bio::EnsEMBL::Hive::Analysis;
 
 use strict;
+use warnings;
 
 use Bio::EnsEMBL::Hive::Utils ('stringify');
 use Bio::EnsEMBL::Hive::AnalysisCtrlRule;
 use Bio::EnsEMBL::Hive::DataflowRule;
+use Bio::EnsEMBL::Hive::GuestProcess;
 
 use base ( 'Bio::EnsEMBL::Hive::Cacheable', 'Bio::EnsEMBL::Hive::Storable' );
  
@@ -62,11 +64,23 @@ sub logic_name {
     return $self->{'_logic_name'};
 }
 
+sub name {              # a useful synonym
+    my $self = shift;
+
+    return $self->logic_name(@_);
+}
+
 
 sub module {
     my $self = shift;
     $self->{'_module'} = shift if(@_);
     return $self->{'_module'};
+}
+
+sub language {
+    my $self = shift;
+    $self->{'_language'} = shift if(@_);
+    return $self->{'_language'};
 }
 
 
@@ -132,33 +146,23 @@ sub get_compiled_module_name {
     my $runnable_module_name = $self->module
         or die "Analysis '".$self->logic_name."' does not have its 'module' defined";
 
+    if ($self->language) {
+        my $wrapper = Bio::EnsEMBL::Hive::GuestProcess::_get_wrapper_for_language($self->language);
+        if (system($wrapper, 'compile', $runnable_module_name)) {
+            die "The runnable module '$runnable_module_name' cannot be loaded or compiled:\n";
+        }
+        return 'Bio::EnsEMBL::Hive::GuestProcess';
+    }
+
     eval "require $runnable_module_name";
     die "The runnable module '$runnable_module_name' cannot be loaded or compiled:\n$@" if($@);
     die "Problem accessing methods in '$runnable_module_name'. Please check that it inherits from Bio::EnsEMBL::Hive::Process and is named correctly.\n"
         unless($runnable_module_name->isa('Bio::EnsEMBL::Hive::Process'));
 
+    die "DEPRECATED: the strict_hash_format() method is no longer supported in Runnables - the input_id() in '$runnable_module_name' has to be a hash now.\n"
+        if($runnable_module_name->can('strict_hash_format'));
+
     return $runnable_module_name;
-}
-
-
-=head2 process
-
-  Arg [1]    : none
-  Example    : $process = $analysis->process;
-  Description: construct a Process object from the $analysis->module name
-  Returntype : Bio::EnsEMBL::Hive::Process subclass 
-  Exceptions : none
-  Caller     : general
-
-=cut
-
-sub process {
-    my $self = shift;
-
-    my $runnable_object = $self->get_compiled_module_name->new();
-    $runnable_object->analysis( $self );
-
-    return $runnable_object;
 }
 
 
@@ -176,18 +180,18 @@ sub process {
 =cut
 
 sub url {
-    my ($self, $ref_dba) = @_;  # if reference dba is the same as 'our' dba, a shorter url is generated
+    my ($self, $ref_dba) = @_;  # if reference dba is the same as 'my' dba, a shorter url is generated
 
-    my $adaptor = $self->adaptor;
-    return ( ($adaptor and $adaptor->db ne ($ref_dba//'') ) ? $adaptor->db->dbc->url . '/analysis?logic_name=' : '') . $self->logic_name;
+    my $my_dba = $self->adaptor && $self->adaptor->db;
+    return ( ($my_dba and $my_dba ne ($ref_dba//'') ) ? $my_dba->dbc->url . '/analysis?logic_name=' : '') . $self->logic_name;
 }
 
 
 sub display_name {
-    my ($self, $ref_dba) = @_;  # if reference dba is the same as 'our' dba, a shorter display_name is generated
+    my ($self, $ref_dba) = @_;  # if reference dba is the same as 'my' dba, a shorter display_name is generated
 
-    my $adaptor = $self->adaptor;
-    return ($adaptor and $adaptor->db ne ($ref_dba//'') ) ? $adaptor->db->dbc->dbname.'/'.$self->logic_name : $self->logic_name;
+    my $my_dba = $self->adaptor && $self->adaptor->db;
+    return ( ($my_dba and $my_dba ne ($ref_dba//'') ) ? $my_dba->dbc->dbname . '/' : '' ) . $self->logic_name;
 }
 
 
@@ -205,11 +209,7 @@ sub display_name {
 sub stats {
     my $self = shift @_;
 
-    my $collection = Bio::EnsEMBL::Hive::AnalysisStats->collection();
-
-    return $collection
-        ? $collection->find_one_by('analysis', $self)
-        : $self->adaptor->db->get_AnalysisStatsAdaptor->fetch_by_analysis_id( $self->dbID );
+    return $self->hive_pipeline->collection_of( 'AnalysisStats' )->find_one_by('analysis', $self);
 }
 
 
@@ -225,25 +225,36 @@ sub jobs_collection {
 sub control_rules_collection {
     my $self = shift @_;
 
-    my $collection = Bio::EnsEMBL::Hive::AnalysisCtrlRule->collection();
-
-    return $collection
-        ? $collection->find_all_by('ctrled_analysis', $self)
-        : $self->adaptor->db->get_AnalysisCtrlRuleAdaptor->fetch_all_by_ctrled_analysis_id( $self->dbID );
+    return $self->hive_pipeline->collection_of( 'AnalysisCtrlRule' )->find_all_by('ctrled_analysis', $self);
 }
 
 
 sub dataflow_rules_collection {
     my $self = shift @_;
 
-    return Bio::EnsEMBL::Hive::DataflowRule->collection()->find_all_by('from_analysis', $self);
+    return $self->hive_pipeline->collection_of( 'DataflowRule' )->find_all_by('from_analysis', $self);
+}
+
+
+sub dataflow_rules_by_branch {
+    my $self = shift @_;
+
+    if (not $self->{'_dataflow_rules_by_branch'}) {
+        my %dataflow_rules_by_branch = ();
+        foreach my $dataflow (@{$self->dataflow_rules_collection}) {
+            push @{$dataflow_rules_by_branch{$dataflow->branch_code}}, $dataflow;
+        }
+        $self->{'_dataflow_rules_by_branch'} = \%dataflow_rules_by_branch;
+    }
+
+    return $self->{'_dataflow_rules_by_branch'};
 }
 
 
 sub toString {
     my $self = shift @_;
 
-    return 'Analysis['.($self->dbID // '').']: '.$self->display_name.'->('.join(', ', $self->module, $self->parameters, $self->resource_class->name).')';
+    return 'Analysis['.($self->dbID // '').']: '.$self->display_name.'->('.join(', ', ($self->module // 'no_module').($self->language ? sprintf(' (%s)', $self->language) : ''), $self->parameters // '{}', $self->resource_class ? $self->resource_class->name : 'no_rc').')';
 }
 
 1;
